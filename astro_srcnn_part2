@@ -1,0 +1,825 @@
+
+# # Lahore-Sky SRCNN · Part 2: dataset, training loop, evaluation
+#
+# Builds on Part 1 (imported from `astro_srcnn_lib.py`, sections 0-4 of the Part 1 notebook). Steps:
+#
+# 1. **Fields.** Real HST drizzles via MAST (`MODE = "full"`) or synthetic HST-like fields (`MODE = "quick"`, offline, CPU).
+#    The six evaluation fields of the paper (M42, M31, M51 for image quality; M13, M92, M3 for stellar metrics) are
+#    **held out completely**: no training tile is ever cut from them.
+# 2. **Frame bank.** Each frame is one simulated Lahore night through `simulate_lahore_frame` → `prepare_network_pair`,
+#    plus a star catalogue built with the *same* rules as `evaluate_sr` (dominance, contamination, SNR).
+# 3. **Training.** Random and star-centred patches, dihedral augmentation, loss = asinh-L1 (image) + λ · aperture-flux
+#    error. The flux term uses photutils' exact circular-aperture weights, so training and evaluation measure flux identically.
+# 4. **Evaluation.** PSNR/SSIM on a fixed asinh stretch (Table I), FWHM and ellipticity of PSF-consistent stars (Table II),
+#    and flux conservation against the 2.5 % limit (Table III), pooled over several simulated nights per field.
+# 5. **Tables.** The same writer produces Markdown and IEEE LaTeX (booktabs + siunitx + threeparttable), so results drop
+#    straight into the Overleaf template.
+#
+# **Colab:** put `astro_srcnn_lib.py` in the Google Drive folder `lahore_srcnn`, choose a GPU runtime, and run all. The setup
+# cell connects Drive and works inside that folder, so the frame bank and checkpoints survive a disconnect: if Colab drops
+# the session, reconnect and run all again and it resumes where it stopped. Large HST downloads go to Colab's temporary
+# disk, not your Drive.
+
+# %%
+# !pip install -q "photutils>=3.0" "astroquery>=0.4.10" aotools scikit-image
+
+# %%
+# ---- Colab setup: connect Google Drive and work inside one folder there -----------------------------------------------
+import os
+import sys
+
+WORK_DIR = "/content/drive/MyDrive/lahore_srcnn"   # Drive folder that holds astro_srcnn_lib.py; results are saved here
+IN_COLAB = "google.colab" in sys.modules
+if IN_COLAB:
+    from google.colab import drive
+    drive.mount("/content/drive")
+    os.makedirs(WORK_DIR, exist_ok=True)
+    os.chdir(WORK_DIR)
+    if os.path.abspath(WORK_DIR) not in sys.path:
+        sys.path.insert(0, os.path.abspath(WORK_DIR))
+print("working folder:", os.getcwd())
+HST_CACHE = "/content/hst_cache" if IN_COLAB else "hst_cache"   # big FITS files: temporary disk, not Drive
+
+# %%
+import json
+import math
+import time
+import zlib
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+from scipy import ndimage
+from astropy.table import Table, vstack
+from skimage.metrics import structural_similarity
+from photutils.aperture import CircularAperture
+
+if not Path("astro_srcnn_lib.py").exists():
+    raise FileNotFoundError(f"astro_srcnn_lib.py is not in {os.getcwd()}. Upload it to that folder (Google Drive: "
+                            "My Drive/lahore_srcnn), then run this cell again.")
+from astro_srcnn_lib import (AstroSRCNN, SimConfig, P_HR, DEVICE, HST_FILTERS, count_parameters,
+                             download_drizzled_products, encircled_energy_radius, evaluate_sr, load_hst_drizzled,
+                             make_hr_truth, prepare_network_pair, query_hst_deep_sky, sample_lahore_conditions,
+                             simulate_lahore_frame)
+
+# %% [markdown]
+# ## 0 · Experiment configuration
+# `MODE = "quick"` runs the whole chain on synthetic fields in a few minutes on a CPU, which is how this notebook was tested.
+# `MODE = "full"` is the paper run: real HST fields, a few hundred simulated nights, ~30k iterations on a GPU.
+
+# %%
+MODE = os.environ.get("ASTRO_MODE", "full")   # "full" = paper run (MAST + GPU) | "quick" = offline synthetic smoke test
+
+
+@dataclass(frozen=True)
+class ExperimentConfig:
+    use_mast: bool = True
+    out_dir: str = "astro_srcnn_run_v3"
+    seed: int = 2026
+    # (target, preferred HST filter or None, row label used in the tables)
+    train_targets: tuple = (("M5", None), ("M15", None), ("M2", None), ("M27", None), ("M101", None), ("M81", None),
+                            ("M82", None), ("NGC 7331", None), ("M16", None), ("M1", None), ("M33", None), ("M4", None))
+    val_targets: tuple = (("M57", None), ("NGC 6543", None))
+    eval_extended: tuple = (("M42", "F658N", "M42"), ("M31", "F814W", "M31 disk"), ("M51", "F555W", "M51"))
+    eval_stellar: tuple = (("M13", "F814W", "M13"), ("M92", "F814W", "M92"), ("M3", "F814W", "M3"))
+    tile_hr: int = 320                 # simulated tile (HR px) before the PSF margin is cropped
+    max_invalid_frac: float = 0.25     # chip gaps / mosaic edges allowed per tile (masked out of losses and metrics)
+    min_valid_frac: float = 0.5        # frames with fewer usable pixels after simulation are discarded
+    frames_per_train_field: int = 40
+    frames_per_val_field: int = 8
+    nights_per_eval_field: int = 6
+    tiles_per_eval_night: int = 6
+    n_subs_range: tuple = (8, 49)      # stack depth drawn per frame (Bortle 9 sessions: 8-48 short subs)
+    psf_seeds: int = 3                 # independent aotools PSF realisations per r0 bin
+    # training
+    patch_hr: int = 144                # must hold the flux aperture (r_ap up to ~43 px for red filters) + network border
+    batch_size: int = 32
+    iterations: int = 30_000
+    lr: float = 2e-4
+    warmup: int = 500
+    asinh_beta: float = 2.0            # stretch softening in noise units (σ_LR = 1)
+    lambda_flux: float = 5.0
+    star_patch_frac: float = 0.5
+    val_every: int = 2000
+    num_workers: int = 2
+    # metrics
+    metric_beta: float = 3.0           # PSNR/SSIM stretch: asinh(x / 3σ)
+    metric_white_pct: float = 99.5     # white point = this percentile of the target's valid pixels
+    min_flux_stars_for_claim: int = 10 # fewer stars than this -> dagger "low statistics" in Table III
+
+
+if MODE == "quick":
+    CFG = ExperimentConfig(use_mast=False, out_dir="astro_srcnn_quick", tile_hr=416, frames_per_train_field=6,
+                           frames_per_val_field=3,
+                           train_targets=(("SYN-A", None), ("SYN-B", None), ("SYN-C", None)),
+                           val_targets=(("SYN-V", None),), nights_per_eval_field=2, tiles_per_eval_night=1,
+                           n_subs_range=(16, 33), psf_seeds=1, batch_size=8, iterations=600, warmup=30, val_every=150,
+                           num_workers=0)
+else:
+    CFG = ExperimentConfig()
+OUT = Path(CFG.out_dir)
+OUT.mkdir(parents=True, exist_ok=True)
+SIM = SimConfig()
+print(f"MODE={MODE} on {DEVICE}; outputs -> {OUT.resolve()}")
+if MODE == "full" and DEVICE.type != "cuda":
+    print("WARNING: no GPU. In Colab: Runtime > Change runtime type > T4 GPU, then Runtime > Run all.")
+
+# %% [markdown]
+# ## 1 · Fields: real HST (MAST) or synthetic stand-ins
+# Synthetic fields reuse the Part 1 physics (HST-like count rates in ACS/F555W units on the 0.6″ grid) and come in two kinds:
+# *stellar* (cluster-like, centrally concentrated) and *extended* (an inclined disc galaxy or structured nebulosity with
+# fewer stars). They exist only so the code can be tested offline. Paper numbers must come from `MODE = "full"`.
+
+# %%
+def _splat(img, x, y, w):
+    """Bilinear point-source deposition (sub-pixel positions, exact flux)."""
+    x0, y0 = np.floor(x).astype(int), np.floor(y).astype(int)
+    fx, fy = x - x0, y - y0
+    ny, nx = img.shape
+    for dx, dy, f in ((0, 0, (1 - fx) * (1 - fy)), (1, 0, fx * (1 - fy)), (0, 1, (1 - fx) * fy), (1, 1, fx * fy)):
+        xi, yi = x0 + dx, y0 + dy
+        ok = (xi >= 0) & (xi < nx) & (yi >= 0) & (yi < ny)
+        np.add.at(img, (yi[ok], xi[ok]), (w * f)[ok])
+
+
+def synthetic_field(name: str, kind: str, rng: np.random.Generator, n: int = 512, label: str | None = None) -> dict:
+    img = np.zeros((n, n))
+    rate_v15 = 1.93e4                                   # ACS/F555W e-/s for an AB = 15 star
+    if kind == "stellar":                               # cluster outskirts: mildly concentrated
+        n_star = 260
+        r = np.abs(rng.normal(0, n / 2.2, n_star))
+        th = rng.uniform(0, 2 * np.pi, n_star)
+        cx, cy = rng.uniform(0.3 * n, 0.7 * n, 2)
+        x, y = cx + r * np.cos(th), cy + r * np.sin(th)
+    else:
+        n_star = 90
+        x, y = rng.uniform(0, n, n_star), rng.uniform(0, n, n_star)
+    mags = 10.8 + 8.2 * rng.power(1.6, x.size)
+    _splat(img, x, y, rate_v15 * 10 ** (-0.4 * (mags - 15.0)))
+    if kind == "extended":
+        yy, xx = np.indices(img.shape).astype(float)
+        if rng.random() < 0.5:                          # inclined disc galaxy with two-armed modulation
+            cx, cy, q, pa = *rng.uniform(0.35 * n, 0.65 * n, 2), rng.uniform(0.4, 0.9), rng.uniform(0, np.pi)
+            xr = (xx - cx) * np.cos(pa) + (yy - cy) * np.sin(pa)
+            yr = (-(xx - cx) * np.sin(pa) + (yy - cy) * np.cos(pa)) / q
+            rr, phi = np.hypot(xr, yr), np.arctan2(yr, xr)
+            arms = 1 + 0.6 * np.cos(2 * (phi - 0.35 * np.log1p(rr)))
+            img += 60.0 * np.exp(-rr / (0.12 * n)) * arms + 400.0 * np.exp(-(rr / (0.02 * n)) ** 0.5 * 7.67)
+        else:                                           # emission nebula: structured lognormal field
+            neb = ndimage.gaussian_filter(rng.lognormal(0, 1.6, img.shape), 8)
+            img += 6.0 * (neb - np.median(neb)).clip(0)
+    mask = np.zeros_like(img, dtype=bool)
+    if rng.random() < 0.5:                              # ACS-like chip gap somewhere in the field
+        g = int(rng.uniform(0.2, 0.8) * n)
+        mask[g:g + 6, :] = True
+        img[mask] = 0.0
+    return dict(name=name, label=label or name, kind=kind, hr_rate=img, hr_mask=mask, p_hr=P_HR, bin_factor=1,
+                pixscale=P_HR, photflam=1.96e-19, photplam=5361.0, photbw=360.0, filter="F555W",
+                dec_deg=float(rng.uniform(5, 45)), path=f"synthetic:{name}")
+
+
+def load_fields(specs, kind: str, cfg: ExperimentConfig, rng: np.random.Generator, first_only: bool = False) -> list:
+    """specs: tuples (target, filter|None[, label]). Real fields come back on the HR grid via make_hr_truth."""
+    fields = []
+    for spec in specs:
+        name, filt = spec[0], spec[1]
+        label = spec[2] if len(spec) > 2 else name
+        if not cfg.use_mast:
+            fields.append(synthetic_field(name, "stellar" if kind == "stellar" else
+                                          ("extended" if kind == "extended" else rng.choice(["stellar", "extended"])),
+                                          rng, label=label))
+            continue
+        obs = query_hst_deep_sky((name,), filters=(filt,) if filt else HST_FILTERS, per_target=1)
+        paths = download_drizzled_products(obs, HST_CACHE)
+        if not paths:
+            print(f"  {name}: no usable HST image found (filter {filt or 'any'}); skipping this target")
+        for p in paths[:1] if first_only else paths:
+            try:
+                f = make_hr_truth(load_hst_drizzled(p))
+            except Exception as exc:
+                print(f"  skip {Path(p).name}: {exc}")
+                continue
+            f.update(name=name, label=f"{label} ({f['filter']})", kind=kind)
+            fields.append(f)
+    return fields
+
+# %% [markdown]
+# ## 2 · Frame bank
+# One entry = one simulated night on one tile. Simulation dominates the cost (~1-3 s per frame), so frames are built once
+# and cached. The star catalogue for the flux loss is exactly the set `evaluate_sr` uses for the network-induced flux test
+# (apertures centred on PSF-consistent point sources with SNR ≥ 20 and ≤ 1 % neighbour contamination).
+
+# %%
+def sample_tile(hr: np.ndarray, mask: np.ndarray, tile: int, rng: np.random.Generator,
+                max_invalid: float = 0.25, multiple_of: int = 2, tries: int = 200):
+    tile = min(tile, *hr.shape)
+    tile -= tile % multiple_of
+    ny, nx = hr.shape
+    for _ in range(tries):
+        y0 = int(rng.integers(0, ny - tile + 1)) // multiple_of * multiple_of
+        x0 = int(rng.integers(0, nx - tile + 1)) // multiple_of * multiple_of
+        sl = (slice(y0, y0 + tile), slice(x0, x0 + tile))
+        if mask[sl].mean() <= max_invalid and hr[sl][~mask[sl]].max(initial=0) > 0:
+            return sl
+    return None
+
+
+def frame_is_usable(x, y, valid, electrons_per_unit, cfg: ExperimentConfig) -> bool:
+    """A single non-finite frame poisons training (one NaN batch turns every weight into NaN), so reject it at the door."""
+    return bool(np.isfinite(x).all() and np.isfinite(y).all() and np.isfinite(electrons_per_unit)
+                and electrons_per_unit > 0 and valid.mean() >= cfg.min_valid_frac)
+
+
+def make_frame(field: dict, rng: np.random.Generator, cfg: ExperimentConfig, star_snr: float = 20.0) -> dict | None:
+    sl = sample_tile(field["hr_rate"], field["hr_mask"], cfg.tile_hr, rng, cfg.max_invalid_frac)
+    if sl is None:
+        return None
+    cond = sample_lahore_conditions(rng, field["dec_deg"])
+    sim = replace(SIM, n_subs=int(rng.integers(*cfg.n_subs_range)))
+    frame = simulate_lahore_frame(field["hr_rate"][sl], field, cond, rng, hr_invalid=field["hr_mask"][sl], sim=sim,
+                                  psf_seed=int(rng.integers(cfg.psf_seeds)))
+    try:
+        pair = prepare_network_pair(frame, sim)
+    except ValueError:                                   # tile almost entirely masked: no noise estimate possible
+        return None
+    if not frame_is_usable(pair["x"].numpy(), pair["y"].numpy(), ~pair["exclude_hr"], pair["electrons_per_unit"], cfg):
+        return None
+    r_ap = encircled_energy_radius(frame["psf_total"], 0.99)
+    # Flux-loss catalogue = exactly the stars evaluate_sr would use for the network-induced flux test.
+    _, tbl = evaluate_sr(pair["x"], pair["y"], pair["x"], electrons_per_unit=pair["electrons_per_unit"],
+                         exclude_mask=pair["exclude_hr"], ap_radius_px=r_ap, input_psf=frame["psf_total"],
+                         min_snr_flux_net=star_snr)
+    stars = np.empty((0, 2))
+    if len(tbl):
+        ok = np.asarray(tbl["flux_star_net"], bool)
+        stars = np.column_stack([np.asarray(tbl["x"])[ok], np.asarray(tbl["y"])[ok]])
+    return dict(x=pair["x"][0, 0].numpy().astype(np.float32), y=pair["y"][0, 0].numpy().astype(np.float32),
+                valid=~pair["exclude_hr"], stars=stars, r_ap=float(r_ap), psf_total=frame["psf_total"].astype(np.float32),
+                electrons_per_unit=float(pair["electrons_per_unit"]), p_hr=float(frame["p_hr"]),
+                field=field["name"], label=field["label"], kind=field["kind"],
+                cond={k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in cond.items()
+                      if k != "frame_offset_px"}, n_subs=sim.n_subs)
+
+
+def field_rng(cfg: ExperimentConfig, name: str) -> np.random.Generator:
+    return np.random.default_rng([cfg.seed, zlib.crc32(name.encode())])
+
+
+def build_bank(specs, n_per_field: int, cfg: ExperimentConfig, tag: str) -> list:
+    """Simulate n_per_field nights for every target in `specs`, loading (downloading) one target at a time.
+
+    Progress is saved to bank_<tag>_partial.pt after each target, so after a Colab disconnect a rerun skips the targets
+    already done. The finished bank is bank_<tag>.pt; once it exists, nothing is downloaded or simulated again.
+    """
+    final, part = OUT / f"bank_{tag}.pt", OUT / f"bank_{tag}_partial.pt"
+    if final.exists():
+        bank = torch.load(final, weights_only=False)
+        good = [f for f in bank if frame_is_usable(f["x"], f["y"], f["valid"], f["electrons_per_unit"], cfg)]
+        print(f"loading cached {final}: {len(good)} usable of {len(bank)} frames")
+        return good
+    state = torch.load(part, weights_only=False) if part.exists() else {"done": [], "bank": []}
+    if state["done"]:
+        print(f"resuming [{tag}]: already done {state['done']}")
+    t0 = time.time()
+    for spec in specs:
+        name = spec[0]
+        if name in state["done"]:
+            continue
+        for j, field in enumerate(load_fields((spec,), "train", cfg, field_rng(cfg, name), first_only=True)):
+            n0 = len(state["bank"])
+            for k in range(n_per_field):
+                rng = np.random.default_rng([cfg.seed, zlib.crc32(tag.encode()), zlib.crc32(name.encode()), j, k])
+                fr = make_frame(field, rng, cfg)
+                if fr is not None:
+                    state["bank"].append(fr)
+            print(f"  [{tag}] {field['label']}: {len(state['bank']) - n0} frames ({time.time() - t0:.0f} s elapsed)")
+        state["done"].append(name)
+        torch.save(state, part)                          # checkpoint after every target
+    torch.save(state["bank"], final)
+    part.unlink(missing_ok=True)
+    return state["bank"]
+
+# %% [markdown]
+# ## 3 · Patch dataset
+# * **Random patches** (≥ 70 % valid pixels) teach the general mapping: noise, diffuse light, faint stars.
+# * **Star-centred patches** (fraction `star_patch_frac`) carry an exact photutils aperture-weight map for the flux loss. The
+#   aperture plus the network's footprint must fit inside the patch, so stars whose aperture is too large are skipped.
+# * Dihedral augmentation (8 rotations/flips) is applied identically to input, target, mask and aperture weights. Mount
+#   trailing has a random direction anyway, so this does not distort the physics.
+
+# %%
+class PatchDataset(Dataset):
+    def __init__(self, bank: list, patch: int, n_items: int, star_frac: float, footprint: int, seed: int,
+                 augment: bool = True):
+        self.bank, self.p, self.n, self.star_frac, self.seed, self.augment = bank, patch, n_items, star_frac, seed, augment
+        self.stars = []                                  # (frame index, x, y, r_ap) usable for the flux loss
+        for i, fr in enumerate(bank):
+            if fr["r_ap"] + footprint + 6 > patch / 2 - 1:
+                continue
+            for x, y in fr["stars"]:
+                if patch / 2 <= x < fr["x"].shape[1] - patch / 2 and patch / 2 <= y < fr["x"].shape[0] - patch / 2:
+                    self.stars.append((i, float(x), float(y), fr["r_ap"]))
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        rng = np.random.default_rng([self.seed, idx])
+        p = self.p
+        w = np.zeros((p, p), np.float32)
+        has_star = False
+        if self.stars and rng.random() < self.star_frac:
+            fi, sx, sy, r_ap = self.stars[rng.integers(len(self.stars))]
+            fr = self.bank[fi]
+            x0 = int(round(sx - p / 2 + rng.integers(-6, 7)))
+            y0 = int(round(sy - p / 2 + rng.integers(-6, 7)))
+            x0 = int(np.clip(x0, 0, fr["x"].shape[1] - p))
+            y0 = int(np.clip(y0, 0, fr["x"].shape[0] - p))
+            w = CircularAperture((sx - x0, sy - y0), r_ap).to_mask(method="exact").to_image((p, p)).astype(np.float32)
+            has_star = True
+        else:
+            for _ in range(20):
+                fr = self.bank[rng.integers(len(self.bank))]
+                ny, nx = fr["x"].shape
+                y0, x0 = int(rng.integers(0, ny - p + 1)), int(rng.integers(0, nx - p + 1))
+                if fr["valid"][y0:y0 + p, x0:x0 + p].mean() >= 0.7:
+                    break
+        sl = (slice(y0, y0 + p), slice(x0, x0 + p))
+        arrs = [fr["x"][sl], fr["y"][sl], fr["valid"][sl].astype(np.float32), w]
+        if self.augment:
+            k, flip = int(rng.integers(4)), bool(rng.integers(2))
+            arrs = [np.rot90(a, k) for a in arrs]
+            if flip:
+                arrs = [a[:, ::-1] for a in arrs]
+        x, y, m, w = (torch.from_numpy(np.ascontiguousarray(a))[None] for a in arrs)
+        return x, y, m, w, torch.tensor(has_star)
+
+# %% [markdown]
+# ## 4 · Losses
+# * **asinh-L1** on the image: linear near the noise level (faint nebulosity counts), logarithmic for bright stars (they
+#   can't swamp the gradient). The *model* stays linear in flux. Only the loss is computed in stretched units.
+# * **Aperture-flux error** |ΣwP − ΣwT| / ΣwT with the exact photutils aperture weights from the dataset: the same aperture
+#   (99 % encircled energy of the input PSF) and the same star selection as `evaluate_sr`.
+# * Pixels within the network's footprint (`receptive_field // 2 + flux_window // 2`) of a patch edge, and masked pixels
+#   (saturation, chip gaps), are excluded from the image loss.
+
+# %%
+def asinh_l1(pred, target, mask, beta):
+    d = (torch.asinh(pred / beta) - torch.asinh(target / beta)).abs()
+    return (d * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def aperture_flux_loss(pred, target, w, has_star):
+    if not bool(has_star.any()):
+        return pred.new_zeros(())
+    fp, ft = (pred * w).sum(dim=(1, 2, 3)), (target * w).sum(dim=(1, 2, 3))
+    rel = (fp - ft).abs() / ft.abs().clamp_min(1e-6)
+    return rel[has_star].mean()
+
+
+def interior_mask(shape, border: int, device) -> torch.Tensor:
+    m = torch.zeros(shape, device=device)
+    m[..., border:-border, border:-border] = 1.0
+    return m
+
+# %% [markdown]
+# ## 5 · Training loop
+# Adam with linear warm-up and cosine decay, gradient clipping, and periodic validation on whole held-out frames
+# (asinh-L1 + flux statistics from `evaluate_sr`). The checkpoint with the best validation image loss is kept; the flux
+# statistics are logged so a run that trades photometry for sharpness is visible immediately.
+
+# %%
+@torch.no_grad()
+def predict_frame(model, x_np: np.ndarray) -> np.ndarray:
+    model.eval()
+    return model(torch.from_numpy(x_np)[None, None].to(DEVICE)).squeeze().float().cpu().numpy()
+
+
+@torch.no_grad()
+def validate(model, bank: list, cfg: ExperimentConfig, border: int) -> dict:
+    losses, dfs = [], []
+    for fr in bank:
+        pred = predict_frame(model, fr["x"])
+        m = fr["valid"].copy()
+        m[:border], m[-border:], m[:, :border], m[:, -border:] = False, False, False, False
+        d = np.abs(np.arcsinh(pred / cfg.asinh_beta) - np.arcsinh(fr["y"] / cfg.asinh_beta))
+        losses.append(float(d[m].mean()))
+        _, tbl = evaluate_sr(pred, fr["y"], fr["x"], electrons_per_unit=fr["electrons_per_unit"],
+                             exclude_mask=~fr["valid"], ap_radius_px=fr["r_ap"], input_psf=fr["psf_total"])
+        if len(tbl):                                     # network-induced flux change δ = F_SR / F_bicubic - 1
+            dfs.extend(np.asarray(tbl["dflux_net"])[np.asarray(tbl["flux_star_net"])].tolist())
+    dfs = np.asarray(dfs)
+    return dict(val_loss=float(np.mean(losses)), n_flux=int(dfs.size),
+                flux_median=float(np.median(dfs)) if dfs.size else float("nan"),
+                flux_p90=float(np.quantile(np.abs(dfs), 0.9)) if dfs.size else float("nan"))
+
+
+def train(train_bank: list, val_bank: list, cfg: ExperimentConfig, model: AstroSRCNN | None = None):
+    """Train with periodic validation. The full training state is saved at every validation step (train_state.pt), so a
+    rerun after a Colab disconnect continues from the last validation instead of starting over."""
+    torch.manual_seed(cfg.seed)
+    model = (model or AstroSRCNN()).to(DEVICE)
+    border = model.receptive_field // 2 + getattr(model, "flux_window", 0) // 2
+    ds = PatchDataset(train_bank, cfg.patch_hr, cfg.iterations * cfg.batch_size, cfg.star_patch_frac, border, cfg.seed)
+    print(f"{len(ds.stars)} star-centred patch sources; model {count_parameters(model):,} params; border {border} px")
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: min(1.0, (i + 1) / cfg.warmup) *
+                                              0.5 * (1 + math.cos(math.pi * min(i, cfg.iterations) / cfg.iterations)))
+    history, best, start_it = [], float("inf"), 0
+    state_path = OUT / "train_state.pt"
+    if state_path.exists():
+        st = torch.load(state_path, map_location=DEVICE, weights_only=False)
+        model.load_state_dict(st["model"])
+        opt.load_state_dict(st["opt"])
+        sched.load_state_dict(st["sched"])
+        history, best, start_it = st["history"], st["best"], st["it"]
+        print(f"resuming training at iteration {start_it} of {cfg.iterations}")
+    # Items are indexed deterministically, so resuming at iteration k means starting at item k * batch_size.
+    sub = torch.utils.data.Subset(ds, range(start_it * cfg.batch_size, len(ds)))
+    dl = DataLoader(sub, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, drop_last=True,
+                    pin_memory=DEVICE.type == "cuda", persistent_workers=cfg.num_workers > 0 and len(sub) > 0)
+    inner = interior_mask((1, 1, cfg.patch_hr, cfg.patch_hr), border, DEVICE)
+    t0 = time.time() - 60 * (history[-1]["minutes"] if history else 0.0)
+    run_img, run_flux, n_win, n_skip, n_flux_win = 0.0, 0.0, 0, 0, 0
+    for it, (x, y, m, w, has) in enumerate(dl, start=start_it + 1):
+        model.train()
+        x, y, m, w, has = (t.to(DEVICE, non_blocking=True) for t in (x, y, m, w, has))
+        pred = model(x)
+        l_img = asinh_l1(pred, y, m * inner, cfg.asinh_beta)
+        l_flux = aperture_flux_loss(pred, y, w, has)
+        loss = l_img + cfg.lambda_flux * l_flux
+        if torch.isfinite(loss):                         # never step on a non-finite batch
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            run_img += float(l_img)
+            run_flux += float(l_flux)
+            n_win += 1
+            n_flux_win += int(has.sum())
+        else:
+            n_skip += 1
+        sched.step()
+        if it % cfg.val_every == 0 or it == cfg.iterations:
+            v = validate(model, val_bank, cfg, border)
+            rec = dict(it=it, train_img=run_img / max(n_win, 1), train_flux=run_flux / max(n_win, 1),
+                       lr=sched.get_last_lr()[0], minutes=(time.time() - t0) / 60, skipped_batches=n_skip,
+                       flux_patches=n_flux_win, **v)
+            history.append(rec)
+            run_img, run_flux, n_win, n_flux_win = 0.0, 0.0, 0, 0
+            print(f"it {it:6d} | train asinh-L1 {rec['train_img']:.4f} flux {rec['train_flux']:.4f} "
+                  f"({rec['flux_patches']} star patches) | val asinh-L1 {v['val_loss']:.4f} | val flux: n={v['n_flux']} "
+                  f"median {v['flux_median']:+.2%} p90 {v['flux_p90']:.2%} | skipped {n_skip} | {rec['minutes']:.1f} min")
+            if v["val_loss"] < best:
+                best = v["val_loss"]
+                torch.save(model.state_dict(), OUT / "astrosrcnn_best.pt")
+            torch.save(model.state_dict(), OUT / "astrosrcnn_last.pt")
+            json.dump(history, open(OUT / "history.json", "w"), indent=1)
+            torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), sched=sched.state_dict(), it=it,
+                            history=history, best=best), state_path)
+        if it >= cfg.iterations:
+            break
+    model.load_state_dict(torch.load(OUT / "astrosrcnn_best.pt", map_location=DEVICE))
+    (OUT / "training_complete.txt").write_text(f"{cfg.iterations} iterations\n")
+    return model, history
+
+# %% [markdown]
+# ## 6 · Evaluation
+# **PSNR / SSIM (Table I).** On a fixed display transform: s(I) = clip(asinh(I/β) / asinh(W/β), 0, 1) with β = 3σ and W =
+# the 99.5th percentile of the target's valid pixels. Prediction, bicubic input and target all use the target's W, so the
+# transform cannot favour either method. Linear-unit PSNR would be set almost entirely by a handful of bright star cores.
+# Valid pixels only, network footprint border excluded, SSIM averaged over the same mask (skimage, 7 × 7 window).
+#
+# **Stars (Tables II, III).** Pooled over all nights and tiles of a field, using `evaluate_sr`'s `shape_star` and
+# `flux_star` flags. FWHM is converted to arcseconds with each frame's own HR scale. Table II is reported for stellar fields
+# only, so there are no FWHM rows for nebulae or galaxies. Table III is reported for every field with its star count; fields
+# with fewer than `min_flux_stars_for_claim` stars are flagged rather than claimed.
+
+# %%
+def psnr_ssim(img: np.ndarray, target: np.ndarray, valid: np.ndarray, beta: float, white_pct: float):
+    w = np.percentile(target[valid], white_pct)
+    norm = np.arcsinh(w / beta)
+
+    def s(a):
+        return np.clip(np.arcsinh(a / beta) / norm, 0.0, 1.0)
+
+    a, b = s(img), s(target)
+    mse = float(np.mean((a[valid] - b[valid]) ** 2))
+    psnr = 10.0 * math.log10(1.0 / max(mse, 1e-12))
+    _, smap = structural_similarity(a, b, data_range=1.0, full=True)
+    return psnr, float(smap[ndimage.binary_erosion(valid, iterations=3)].mean())
+
+
+def evaluate_field(model, field: dict, cfg: ExperimentConfig, field_index: int) -> dict:
+    border = model.receptive_field // 2 + getattr(model, "flux_window", 0) // 2
+    rows, stars, stacks = [], [], []
+    for night in range(cfg.nights_per_eval_field):
+        for t in range(cfg.tiles_per_eval_night):
+            rng = np.random.default_rng([cfg.seed, 777, field_index, night, t])
+            fr = make_frame(field, rng, cfg)
+            if fr is None:
+                continue
+            pred = predict_frame(model, fr["x"])
+            v = fr["valid"].copy()
+            v[:border], v[-border:], v[:, :border], v[:, -border:] = False, False, False, False
+            p_in, s_in = psnr_ssim(fr["x"], fr["y"], v, cfg.metric_beta, cfg.metric_white_pct)
+            p_sr, s_sr = psnr_ssim(pred, fr["y"], v, cfg.metric_beta, cfg.metric_white_pct)
+            rows.append(dict(psnr_in=p_in, psnr_sr=p_sr, ssim_in=s_in, ssim_sr=s_sr, night=night, cond=fr["cond"]))
+            summ, tbl = evaluate_sr(pred, fr["y"], fr["x"], electrons_per_unit=fr["electrons_per_unit"],
+                                    exclude_mask=~fr["valid"], ap_radius_px=fr["r_ap"], input_psf=fr["psf_total"],
+                                    pixel_scale_arcsec=fr["p_hr"])
+            if len(tbl):
+                tbl["p_hr"] = fr["p_hr"]
+                stars.append(tbl)
+            st = summ.get("stack")
+            if st and min(st[k]["n"] for k in st) >= 3 and all(np.isfinite(st[k]["fwhm"]) for k in st):
+                stacks.append(dict(p_hr=fr["p_hr"], n=st["input"]["n"], **{f"{k}_{q}": st[k][q] for k in st
+                                                                          for q in ("fwhm", "ellipticity")}))
+    stars = vstack(stars) if stars else Table()
+    return dict(field=field["name"], label=field["label"], kind=field["kind"], tiles=rows, stars=stars, stacks=stacks)
+
+
+def _ms(v):
+    v = np.asarray(v, float)
+    return [float(np.mean(v)), float(np.std(v, ddof=1)) if v.size > 1 else 0.0]
+
+
+def aggregate(evals: list, cfg: ExperimentConfig) -> dict:
+    res = dict(meta=dict(upscale=SIM.upscale, p_hr=P_HR, nights=cfg.nights_per_eval_field,
+                         tiles_per_night=cfg.tiles_per_eval_night, flux_tol=0.025, pass_quantile=0.9, ap_ee=0.99,
+                         metric_beta=cfg.metric_beta, white_pct=cfg.metric_white_pct,
+                         min_flux_stars=cfg.min_flux_stars_for_claim, mode=MODE),
+               table1=[], table2=[], table3=[])
+    for e in evals:
+        t, st = e["tiles"], e["stars"]
+        if e["kind"] == "extended" and t:
+            res["table1"].append(dict(label=e["label"], tiles=len(t),
+                                      psnr_in=_ms([r["psnr_in"] for r in t]), psnr_sr=_ms([r["psnr_sr"] for r in t]),
+                                      dpsnr=_ms([r["psnr_sr"] - r["psnr_in"] for r in t]),
+                                      ssim_in=_ms([r["ssim_in"] for r in t]), ssim_sr=_ms([r["ssim_sr"] for r in t])))
+        if e["kind"] == "stellar":                      # Table II: per-frame stacked PSFs (crowding-robust)
+            sk = e.get("stacks", [])
+            if not sk:
+                res["table2"].append(dict(label=e["label"], n=0, frames=0))
+            else:
+                med = lambda key, arcsec: float(np.median([s_[key] * (s_["p_hr"] if arcsec else 1.0) for s_ in sk]))
+                res["table2"].append(dict(label=e["label"], n=int(sum(s_["n"] for s_ in sk)), frames=len(sk),
+                                          fwhm_in=med("input_fwhm", True), fwhm_sr=med("pred_fwhm", True),
+                                          fwhm_tgt=med("target_fwhm", True), e_in=med("input_ellipticity", False),
+                                          e_sr=med("pred_ellipticity", False), e_tgt=med("target_ellipticity", False)))
+        if len(st) == 0:
+            res["table3"].append(dict(label=e["label"], n=0))
+            continue
+        fl = np.asarray(st["flux_star_net"])
+        d_sr, d_in = np.asarray(st["dflux_pred"], float)[fl], np.asarray(st["dflux_input"], float)[fl]
+        d_net = np.asarray(st["dflux_net"], float)[fl]
+        ok = np.isfinite(d_sr) & np.isfinite(d_in) & np.isfinite(d_net)
+        n = int(ok.sum())
+        if n == 0:
+            res["table3"].append(dict(label=e["label"], n=0))
+            continue
+        p90 = float(np.quantile(np.abs(d_net[ok]), 0.9))
+        res["table3"].append(dict(label=e["label"], n=n, df_in=float(np.median(d_in[ok])), df_sr=float(np.median(d_sr[ok])),
+                                  dnet=float(np.median(d_net[ok])), p90_net=p90, passes=bool(p90 < 0.025)))
+    return res
+
+# %% [markdown]
+# ## 7 · Table writer (Markdown + IEEE LaTeX)
+# LaTeX needs `\usepackage{booktabs, siunitx, threeparttable}` in the IEEEtran preamble. Numeric columns are decimal-aligned
+# with siunitx; mean ± s.d. uses siunitx's separate-uncertainty mode. Low-statistics counts get a zero-width dagger
+# (`\rlap`) so the digits stay aligned. Captions sit above the tables, as IEEE style requires.
+
+# %%
+def _tex(s: str) -> str:
+    return s.replace("&", r"\&").replace("%", r"\%").replace("_", r"\_").replace("#", r"\#")
+
+
+def _pm(v, nd):
+    return f"{v[0]:.{nd}f} \\pm {v[1]:.{nd}f}"
+
+
+def latex_tables(res: dict, mockup: bool = False) -> str:
+    m = res["meta"]
+    illus = (r"\item[] \emph{Illustrative values for layout review; not measured results.}" + "\n") if mockup else ""
+    out = [r"% Preamble: \usepackage{booktabs, siunitx, threeparttable}",
+           r"\sisetup{uncertainty-mode = separate, detect-weight = true}", ""]
+
+    # ---- Table I -------------------------------------------------------------------------------------------------
+    rows = [f"{_tex(r['label'])} & {r['tiles']} & {_pm(r['psnr_in'], 1)} & {_pm(r['psnr_sr'], 1)} & "
+            f"{_pm(r['dpsnr'], 1)} & {_pm(r['ssim_in'], 2)} & {_pm(r['ssim_sr'], 2)} \\\\" for r in res["table1"]]
+    # Five mean ± s.d. columns do not fit one IEEE column (3.5 in), so Table I spans both (table*).
+    out += [r"\begin{table*}[!t]", r"\centering",
+            rf"\caption{{Image Quality on Extended Fields, Bicubic vs.\ AstroSRCNN ($\times${m['upscale']})}}",
+            r"\label{tab:psnr_ssim}", r"\begin{threeparttable}", r"\footnotesize", r"\setlength{\tabcolsep}{7pt}",
+            r"\begin{tabular}{@{}l r S[table-format=2.1(1)] S[table-format=2.1(1)] S[table-format=1.1(1)]"
+            r" S[table-format=1.2(2)] S[table-format=1.2(2)]@{}}",
+            r"\toprule",
+            r" & & \multicolumn{3}{c}{PSNR (dB)} & \multicolumn{2}{c}{SSIM} \\",
+            r"\cmidrule(lr){3-5}\cmidrule(l){6-7}",
+            r"Field & $N$ & {Bicubic} & {SRCNN} & {$\Delta$} & {Bicubic} & {SRCNN} \\",
+            r"\midrule", *rows, r"\bottomrule", r"\end{tabular}", r"\begin{tablenotes}[flushleft]", r"\footnotesize",
+            rf"\item Mean $\pm$ s.d.\ over $N$ held-out tiles ({m['nights']} simulated Lahore nights per field). "
+            rf"Metrics on $s(I)=\mathrm{{asinh}}(I/{m['metric_beta']:g}\sigma)$ normalised to the target's "
+            rf"{m['white_pct']:g}th percentile; $\Delta$ is the paired per-tile gain.",
+            illus + r"\end{tablenotes}", r"\end{threeparttable}", r"\end{table*}", ""]
+
+    # ---- Table II ------------------------------------------------------------------------------------------------
+    rows = [f"{_tex(r['label'])} & 0/0 & " + " & ".join(["{n/a}"] * 6) + r" \\" if r["n"] == 0 else
+            f"{_tex(r['label'])} & {r['n']}/{r['frames']} & {r['fwhm_in']:.2f} & {r['fwhm_sr']:.2f} & {r['fwhm_tgt']:.2f} & "
+            f"{r['e_in']:.2f} & {r['e_sr']:.2f} & {r['e_tgt']:.2f} \\\\" for r in res["table2"]]
+    out += [r"\begin{table}[!t]", r"\centering",
+            r"\caption{Point-Source Morphology in Stellar Fields}", r"\label{tab:psf}",
+            r"\begin{threeparttable}", r"\footnotesize", r"\setlength{\tabcolsep}{3.2pt}",
+            r"\begin{tabular}{@{}l c S[table-format=1.2] S[table-format=1.2] S[table-format=1.2]"
+            r" S[table-format=1.2] S[table-format=1.2] S[table-format=1.2]@{}}",
+            r"\toprule",
+            r" & & \multicolumn{3}{c}{FWHM (arcsec)} & \multicolumn{3}{c}{Ellipticity $1-b/a$} \\",
+            r"\cmidrule(lr){3-5}\cmidrule(l){6-8}",
+            r"Field & $N_\star$/fr. & {Input} & {SRCNN} & {Target} & {Input} & {SRCNN} & {Target} \\",
+            r"\midrule", *rows, r"\bottomrule", r"\end{tabular}", r"\begin{tablenotes}[flushleft]", r"\footnotesize",
+            rf"\item Medians over per-frame median stacks of PSF-consistent point sources ($N_\star$ stars in the given number "
+            rf"of frames; frames with $\geq 3$ stars). Stacking suppresses crowding neighbours. FWHM from a "
+            rf"pixel-integrated Gaussian fit, $p_{{\mathrm{{HR}}}} = {m['p_hr']:.3f}''$/px; the target's "
+            rf"{SIM.target_fwhm_hr_px * m['p_hr']:.2f}$''$ is the resolution floor by construction. Ellipticity from "
+            r"second moments ($2.5\times$FWHM window). Extended fields are excluded.",
+            illus + r"\end{tablenotes}", r"\end{threeparttable}", r"\end{table}", ""]
+
+    # ---- Table III -----------------------------------------------------------------------------------------------
+    rows = []
+    for r in res["table3"]:
+        if r["n"] == 0:
+            rows.append(f"{_tex(r['label'])} & 0 & {{n/a}} & {{n/a}} & {{n/a}} & {{n/a}} & n/a \\\\")
+            continue
+        low = r["n"] < m["min_flux_stars"]
+        n_cell = f"{r['n']}" + (r"\rlap{$^{\dagger}$}" if low else "")
+        rows.append(f"{_tex(r['label'])} & {n_cell} & {100 * r['df_in']:+.1f} & {100 * r['df_sr']:+.1f} & "
+                    f"{100 * r['dnet']:+.2f} & {100 * r['p90_net']:.2f} & {'Yes' if r['passes'] else 'No'} \\\\")
+    out += [r"\begin{table}[!t]", r"\centering",
+            r"\caption{Photometric Flux Conservation ($|\delta| < 2.5\,\%$ Limit)}", r"\label{tab:flux}",
+            r"\begin{threeparttable}", r"\footnotesize", r"\setlength{\tabcolsep}{2.0pt}",
+            r"\begin{tabular}{@{}l r S[table-format=+1.1] S[table-format=+1.1] S[table-format=+1.2] S[table-format=1.2] c@{}}",
+            r"\toprule",
+            r" & & \multicolumn{2}{c}{$\Delta F/F$ (\%)} & \multicolumn{2}{c}{$\delta$ (\%)} & \\",
+            r"\cmidrule(lr){3-4}\cmidrule(lr){5-6}",
+            r"Field & $N_F$ & {Bicubic} & {SRCNN} & {Median} & {$P_{90}$} & Pass \\",
+            r"\midrule", *rows, r"\bottomrule", r"\end{tabular}", r"\begin{tablenotes}[flushleft]", r"\footnotesize",
+            rf"\item Same-aperture sums; the aperture encloses {100 * m['ap_ee']:.0f}\,\% of the input PSF energy, so the "
+            r"expected $\Delta F/F$ (error vs.\ truth) floor is $\approx -1$\,\%; these columns are medians (photon noise "
+            r"dominates individual stars). $\delta = F_{\mathrm{SR}}/F_{\mathrm{bicubic}} - 1$ is the flux change made by the "
+            r"network, measured on the same noisy input so that photon noise largely cancels; $P_{90}$ is of $|\delta|$. Apertures centred on point sources with SNR $\geq 20$ and $\leq 1$\,\% "
+            r"neighbour contamination. Pass: $P_{90}|\delta| < 2.5$\,\%.",
+            rf"\item[$\dagger$] $N_F < {m['min_flux_stars']}$: low statistics.",
+            illus + r"\end{tablenotes}", r"\end{threeparttable}", r"\end{table}", ""]
+    return "\n".join(out)
+
+
+def markdown_tables(res: dict, mockup: bool = False) -> str:
+    m = res["meta"]
+    tag = "\n\n*Illustrative values for layout review; not measured results.*" if mockup else ""
+    md = ["**TABLE I. Image quality on extended fields (bicubic vs. AstroSRCNN, ×%d)**\n" % m["upscale"],
+          "| Field | N | PSNR bicubic (dB) | PSNR SRCNN (dB) | ΔPSNR (dB) | SSIM bicubic | SSIM SRCNN |",
+          "|---|---:|---:|---:|---:|---:|---:|"]
+    md += [f"| {r['label']} | {r['tiles']} | {r['psnr_in'][0]:.1f} ± {r['psnr_in'][1]:.1f} | {r['psnr_sr'][0]:.1f} ± "
+           f"{r['psnr_sr'][1]:.1f} | {r['dpsnr'][0]:.1f} ± {r['dpsnr'][1]:.1f} | {r['ssim_in'][0]:.2f} ± "
+           f"{r['ssim_in'][1]:.2f} | {r['ssim_sr'][0]:.2f} ± {r['ssim_sr'][1]:.2f} |" for r in res["table1"]]
+    md += [tag, "", "**TABLE II. Point-source morphology in stellar fields**\n",
+           "| Field | N★/frames | FWHM input (″) | FWHM SRCNN (″) | FWHM target (″) | e input | e SRCNN | e target |",
+           "|---|---:|---:|---:|---:|---:|---:|---:|"]
+    md += [f"| {r['label']} | 0/0 | n/a | n/a | n/a | n/a | n/a | n/a |" if r["n"] == 0 else
+           f"| {r['label']} | {r['n']}/{r['frames']} | {r['fwhm_in']:.2f} | {r['fwhm_sr']:.2f} | {r['fwhm_tgt']:.2f} | "
+           f"{r['e_in']:.2f} | {r['e_sr']:.2f} | {r['e_tgt']:.2f} |" for r in res["table2"]]
+    md += [tag, "", "**TABLE III. Photometric flux conservation (|δ| < 2.5 % limit)**\n",
+           "| Field | N_F | ΔF/F vs truth, bicubic (%) | ΔF/F vs truth, SRCNN (%) | median δ (%) | P90 \\|δ\\| (%) | Pass |",
+           "|---|---:|---:|---:|---:|---:|:---:|"]
+    for r in res["table3"]:
+        if r["n"] == 0:
+            md.append(f"| {r['label']} | 0 | n/a | n/a | n/a | n/a | n/a |")
+        else:
+            dag = "†" if r["n"] < m["min_flux_stars"] else ""
+            md.append(f"| {r['label']} | {r['n']}{dag} | {100 * r['df_in']:+.1f} | {100 * r['df_sr']:+.1f} | "
+                      f"{100 * r['dnet']:+.2f} | {100 * r['p90_net']:.2f} | {'Yes' if r['passes'] else 'No'} |")
+    md += ["\nδ = F_SR / F_bicubic − 1 on the same noisy input (photon noise cancels); ΔF/F vs truth are medians."]
+    md += [f"\n† fewer than {m['min_flux_stars']} stars: low statistics." + tag]
+    return "\n".join(md)
+
+
+def export_paper_artifacts(res: dict, history: list, evals: list, out: Path) -> None:
+    """Files read by main.tex, so the manuscript fills itself from a real run.
+
+    history.csv         convergence figure (train/val asinh-L1, train flux error, val flux P90 in %)
+    flux_errors.csv     every flux star of every evaluation field: ΔF/F (%) for SRCNN and bicubic (histogram figure)
+    results_macros.tex  \\newcommand definitions for the numbers quoted in the abstract and results text
+    """
+    nan = float("nan")
+    with open(out / "history.csv", "w") as f:
+        f.write("it,train_img,train_flux,val_loss,val_flux_p90\n")
+        for h in history:
+            p90 = 100 * h["flux_p90"] if np.isfinite(h["flux_p90"]) else nan
+            f.write(f"{h['it']},{h['train_img']:.6g},{h['train_flux']:.6g},{h['val_loss']:.6g},{p90:.6g}\n")
+    pooled_sr, pooled_in, pooled_net = [], [], []
+    with open(out / "flux_errors.csv", "w") as f:
+        f.write("dflux_pred,dflux_input,dflux_net,field\n")
+        for e in evals:
+            st = e["stars"]
+            if len(st) == 0:
+                continue
+            fl = np.asarray(st["flux_star_net"])
+            for dp, di, dn in zip(np.asarray(st["dflux_pred"], float)[fl], np.asarray(st["dflux_input"], float)[fl],
+                                  np.asarray(st["dflux_net"], float)[fl]):
+                if np.isfinite(dp) and np.isfinite(di) and np.isfinite(dn):
+                    f.write(f"{100 * dp:.4f},{100 * di:.4f},{100 * dn:.4f},{e['field'].replace(' ', '')}\n")
+                    pooled_sr.append(dp)
+                    pooled_in.append(di)
+                    pooled_net.append(dn)
+
+    def num(v, nd, signed=False):
+        if v is None or not np.isfinite(v):
+            return "n/a"
+        s = f"{v:+.{nd}f}" if signed else f"{v:.{nd}f}"
+        return f"${s}$"
+
+    t1, t2 = res["table1"], [r for r in res["table2"] if r["n"] > 0]
+    t3 = [r for r in res["table3"] if r["n"] > 0]
+    claim = [r for r in t3 if r["n"] >= res["meta"]["min_flux_stars"]]
+    mean = (lambda rows, key, i=None: float(np.mean([r[key][i] if i is not None else r[key] for r in rows]))
+            if rows else nan)
+    macros = {
+        "ResMode": MODE,
+        "ResIterations": f"{CFG.iterations:,}".replace(",", "{,}"),
+        "ResTrainMinutes": f"{history[-1]['minutes']:.0f}" if history else "n/a",
+        "ResPSNRin": num(mean(t1, "psnr_in", 0), 1), "ResPSNRsr": num(mean(t1, "psnr_sr", 0), 1),
+        "ResPSNRgain": num(mean(t1, "dpsnr", 0), 1),
+        "ResSSIMin": num(mean(t1, "ssim_in", 0), 2), "ResSSIMsr": num(mean(t1, "ssim_sr", 0), 2),
+        "ResFWHMin": num(mean(t2, "fwhm_in"), 2), "ResFWHMsr": num(mean(t2, "fwhm_sr"), 2),
+        "ResFWHMtgt": num(mean(t2, "fwhm_tgt"), 2),
+        "ResEin": num(mean(t2, "e_in"), 2), "ResEsr": num(mean(t2, "e_sr"), 2),
+        "ResNflux": str(len(pooled_sr)),
+        "ResFluxMedSR": num(100 * np.median(pooled_sr), 1, True) if pooled_sr else "n/a",
+        "ResFluxMedIn": num(100 * np.median(pooled_in), 1, True) if pooled_in else "n/a",
+        "ResFluxNetMed": num(100 * np.median(pooled_net), 2, True) if pooled_net else "n/a",
+        "ResFluxPninetyMax": num(100 * max(r["p90_net"] for r in claim), 2) if claim else "n/a",
+        "ResFieldsPass": f"{sum(r['passes'] for r in claim)} of {len(claim)}",
+    }
+    with open(out / "results_macros.tex", "w") as f:
+        f.write(f"% Written by Part 2 (MODE={MODE}). Do not edit by hand; rerun Part 2 instead.\n")
+        for k, v in macros.items():
+            f.write(f"\\newcommand{{\\{k}}}{{{v}}}\n")
+    print(f"paper artifacts: {[p.name for p in (out / 'history.csv', out / 'flux_errors.csv', out / 'results_macros.tex')]}")
+
+# %% [markdown]
+# ## 8 · Run
+# Every stage saves to `out_dir` on Drive. After a disconnect, reconnect and run all: finished stages are loaded, not
+# repeated. In `MODE = "full"` budget roughly 40-70 min for the banks (downloads + CPU simulation), 30-60 min of GPU time for
+# 30k iterations, and 15-25 min for the evaluation.
+
+# %%
+train_bank = build_bank(CFG.train_targets, CFG.frames_per_train_field, CFG, "train")
+val_bank = build_bank(CFG.val_targets, CFG.frames_per_val_field, CFG, "val")
+print(f"bank: {len(train_bank)} train / {len(val_bank)} val frames from "
+      f"{len({f['field'] for f in train_bank})} training targets, "
+      f"{sum(len(f['stars']) for f in train_bank)} catalogued training stars")
+
+# %%
+if (OUT / "training_complete.txt").exists() and (OUT / "history.json").exists():
+    print("training already finished in an earlier session: loading the best checkpoint")
+    model = AstroSRCNN().to(DEVICE)
+    model.load_state_dict(torch.load(OUT / "astrosrcnn_best.pt", map_location=DEVICE))
+    history = json.load(open(OUT / "history.json"))
+else:
+    model, history = train(train_bank, val_bank, CFG)
+
+# %%
+eval_fields = [f for specs, kind in ((CFG.eval_extended, "extended"), (CFG.eval_stellar, "stellar"))
+               for spec in specs for f in load_fields((spec,), kind, CFG, field_rng(CFG, spec[0]), first_only=True)]
+print(f"evaluation fields: {[f['label'] for f in eval_fields]}")
+evals = [evaluate_field(model, f, CFG, i) for i, f in enumerate(eval_fields)]
+results = aggregate(evals, CFG)
+json.dump(results, open(OUT / "results.json", "w"), indent=1)
+(OUT / "tables.tex").write_text(latex_tables(results))
+(OUT / "tables.md").write_text(markdown_tables(results))
+export_paper_artifacts(results, history, evals, OUT)   # copy these 4 files next to main.tex in Overleaf
+print(markdown_tables(results))
+print(f"\nLaTeX written to {OUT / 'tables.tex'}  (MODE={MODE}: "
+      f"{'synthetic smoke-test numbers, not for the paper' if MODE == 'quick' else 'paper results'})")
+
+# %% [markdown]
+# ## 9 · Collect the files for the paper
+# Zips everything the manuscript and its review need into `paper_results.zip` (in the Drive folder) and, in Colab, starts a
+# download. These files go next to `main.tex` in Overleaf.
+
+# %%
+import shutil
+
+bundle = OUT / "paper_results"
+bundle.mkdir(exist_ok=True)
+for name in ("tables.tex", "results_macros.tex", "history.csv", "flux_errors.csv", "results.json", "history.json",
+             "tables.md", "astrosrcnn_best.pt"):
+    if (OUT / name).exists():
+        shutil.copy(OUT / name, bundle / name)
+zip_path = shutil.make_archive(str(OUT / "paper_results"), "zip", bundle)
+print(f"bundle: {zip_path}  ({sorted(p.name for p in bundle.iterdir())})")
+if IN_COLAB:
+    from google.colab import files as colab_files
+    colab_files.download(zip_path)
