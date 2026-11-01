@@ -1,0 +1,8 @@
+torch
+photutils>=3.0
+astroquery>=0.4.10
+aotools
+scikit-image
+astropy
+numpy
+scipy
