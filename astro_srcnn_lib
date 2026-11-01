@@ -1,0 +1,1261 @@
+# This section builds everything *except* the training loop:
+#
+# 1. **Data sourcing.** Deep, drizzled HST images (ACS/WFC, WFC3/UVIS) from MAST / the Hubble Legacy Archive via `astroquery`,
+#    converted from HST count rates into **photons per second per cm² per Å** using each file's own `PHOTFLAM`/`PHOTPLAM`/`PHOTBW`.
+# 2. **Lahore degradation pipeline.** A forward model that takes those photons through Lahore's atmosphere and a backyard
+#    telescope: Rayleigh + aerosol + ozone extinction, Bortle 8/9 skyglow with a light-dome gradient, Kolmogorov/von Kármán seeing
+#    from `aotools` phase screens, DIY-mount tracking errors, and a CMOS detector.
+# 3. **Model + metrics.** A photometry-aware SRCNN and `photutils` metrics for stellar FWHM, point-source ellipticity, and flux
+#    conservation against a 2.5 % limit.
+#
+# **Unit convention used throughout**
+# * `hr_*` arrays live on the high-resolution (HR) grid, pixel scale `p_hr` (default 0.6″/px).
+# * `lr_*` arrays live on the detector grid, `p_lr = upscale × p_hr` (default 1.2″/px).
+# * Physical images are in **electrons** for one sub-exposure. Network tensors are in *noise-normalised surface-brightness units*
+#   (see `prepare_network_pair`), which are linear in flux, so photometry survives the round trip.
+
+# %%
+# Colab ships torch / numpy / scipy / astropy / matplotlib. photutils is pinned to 3.x because 3.0 renamed several
+# DAOStarFinder arguments and output columns (sharpness_range, x_centroid, ...).
+#   pip install -q "photutils>=3.0" "astroquery>=0.4.10" aotools
+
+# %%
+from __future__ import annotations
+
+import functools
+import math
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+from scipy import ndimage, signal, special
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from astropy.io import fits
+from astropy.nddata import block_reduce
+from astropy.stats import SigmaClip, sigma_clipped_stats
+from astropy.table import Table, vstack
+from astropy.wcs import WCS, FITSFixedWarning
+from astropy.wcs.utils import proj_plane_pixel_scales
+
+import aotools
+from aotools.turbulence.phasescreen import ft_sh_phase_screen
+
+from photutils.aperture import ApertureStats, CircularAnnulus, CircularAperture
+from photutils.background import Background2D, MedianBackground
+from photutils.detection import DAOStarFinder
+from photutils.morphology import data_properties
+from photutils.psf import fit_fwhm
+
+# ---- physical constants (CGS where it matters for photon bookkeeping) --------------------------------------------------
+ARCSEC_PER_RAD = 206264.80624709636
+H_CGS = 6.62607015e-27            # Planck constant [erg s]
+C_CGS = 2.99792458e10             # speed of light [cm s^-1]
+OMEGA_SIDEREAL = 7.2921159e-5     # Earth's sidereal rotation rate [rad s^-1]
+SIDEREAL_RATE_ARCSEC_S = 15.041   # RA-axis tracking rate [arcsec s^-1]
+FWHM_PER_SIGMA = 2.0 * math.sqrt(2.0 * math.log(2.0))
+
+_trapz = getattr(np, "trapezoid", None) or np.trapz   # numpy>=2 renamed trapz -> trapezoid
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"torch {torch.__version__} on {DEVICE} | aotools {getattr(aotools, '__version__', '?')}")
+
+# %% [markdown]
+# ## 0 · Configuration
+# Every physical assumption is a named parameter. Ranges are sampled per training pair so the network sees the whole
+# distribution of Lahore nights instead of one "typical" night.
+
+# %%
+@dataclass(frozen=True)
+class TelescopeConfig:
+    """Default: 130 mm f/5 Newtonian, a light enough payload for a home-built mount."""
+    aperture_m: float = 0.130
+    focal_length_m: float = 0.650
+    obstruction_ratio: float = 0.27       # secondary / primary diameter (0 for a refractor)
+    n_spider_vanes: int = 4               # 0 for a refractor; 3 or 4 for most Newtonians
+    spider_width_m: float = 0.0010
+    spider_angle_deg: float = 0.0         # vanes are fixed to the tube, and so is the camera -> fixed in sensor frame
+    optical_throughput: float = 0.80      # two aluminium mirrors (~0.9 each) x coma corrector
+
+
+@dataclass(frozen=True)
+class CameraConfig:
+    """Default: 3.76 um CMOS (IMX533 class) at unity gain."""
+    pixel_um: float = 3.76
+    sensor_shape: tuple = (3008, 3008)    # used only to place the HST field inside a realistic full-frame gradient
+    qe: float = 0.80                      # treated as flat across each HST band
+    gain_e_per_adu: float = 1.0
+    offset_adu: int = 50                  # bias pedestal so negative read noise is preserved before the ADC
+    adc_bits: int = 14                    # at unity gain the ADC (16383 e-) saturates before the 50 ke- well
+    full_well_e: float = 50_000.0
+    read_noise_e: float = 1.5
+    dark_e_per_s: float = 0.05            # cooled to ~0 C. An uncooled camera on a 30 C Lahore summer night: 0.5-2 e-/s
+
+
+@dataclass(frozen=True)
+class SiteConfig:
+    """Lahore, Pakistan. Aerosol numbers from AERONET Lahore climatology (see comments in sample_lahore_conditions)."""
+    name: str = "Lahore"
+    latitude_deg: float = 31.5497
+    elevation_m: float = 217.0
+    # Light pollution: zenith sky brightness in V (AB mag/arcsec^2). Approx. SQM <-> Bortle: class 8 ~ 18.0-18.4,
+    # class 9 brighter than ~18.0. Inner Lahore on a smoggy night can reach ~17.3.
+    mu_v_range: tuple = (17.3, 18.4)
+    led_fraction_range: tuple = (0.4, 0.8)  # share of skyglow photons from white LEDs vs high-pressure sodium
+    # Dome amplitude/scale height give zenith-to-20°-altitude brightening of ~0.8-1.5 mag, typical of urban all-sky surveys.
+    light_dome_amplitude_range: tuple = (2.0, 10.0)
+    light_dome_scale_height_deg: float = 12.0
+    light_dome_width_deg: float = 45.0
+    # Aerosol optics (AERONET Lahore: SSA 0.80-0.89, asymmetry 0.70-0.83).
+    aerosol_ssa: float = 0.85
+    aerosol_asymmetry_g: float = 0.72
+    ozone_du: float = 280.0
+    # Turbulence. No published site-testing campaign exists for Lahore; a flat, hot, urban plain with a strong
+    # boundary layer suggests 2-4" (DIMM convention, 500 nm, zenith). Treat these as tunable priors.
+    seeing_median_arcsec: float = 2.8
+    seeing_log_sigma: float = 0.25
+    outer_scale_m: float = 20.0
+    inner_scale_m: float = 0.005
+    min_altitude_deg: float = 30.0
+
+
+@dataclass(frozen=True)
+class MountConfig:
+    """Error budget of an unguided, home-built German equatorial mount (stepper + worm or belt reduction)."""
+    exposure_s_range: tuple = (30.0, 120.0)        # Bortle 9 forces short subs
+    worm_period_s: float = 480.0                   # set to YOUR worm-gear period (360 deg / worm-wheel teeth, in sidereal s)
+    pe_amplitude_arcsec_range: tuple = (2.0, 10.0) # semi-amplitude of the fundamental periodic error
+    pe_harmonic_ratios: tuple = (0.35, 0.15)       # relative amplitudes of the 2nd and 3rd harmonics
+    rate_error_frac_range: tuple = (-5e-4, 5e-4)   # microstep quantisation / clock error in the sidereal rate
+    polar_error_arcmin_range: tuple = (2.0, 15.0)  # polar-alignment error (no clear view of Polaris from many rooftops)
+    jitter_rms_arcsec: float = 0.35                # stepper resonance / mirror vibration (RA; Dec gets half)
+    random_walk_arcsec_per_sqrt_s: float = 0.04    # gear-tooth irregularity, belt creep
+    jump_rate_per_exposure: float = 0.08           # Poisson rate of discrete jumps (cable snag, wind gust, backlash)
+    jump_mean_arcsec: float = 2.0
+    dt_s: float = 0.02                             # trajectory sampling step
+
+
+@dataclass(frozen=True)
+class SimConfig:
+    upscale: int = 2                     # SR factor; LR = detector grid
+    n_subs: int = 1                      # >1 simulates a registered mean stack (independent drift per sub)
+    target_fwhm_hr_px: float = 2.0       # target PSF: Nyquist-sampled Gaussian (see make_target_psf for why)
+    target_includes_extinction: bool = True
+    psf_fft_size: int = 256              # aotools grid; the image-plane field is psf_fft_size * p_hr / oversample
+    psf_n_screens: int = 48              # x4 rotations = 192 PSF realisations per long-exposure PSF
+    psf_energy_crop: float = 0.99        # crop PSF to this encircled energy (the FFT field wraps the far halo anyway)
+    psf_r0_bin_frac: float = 0.03        # PSF cache quantisation in ln(r0)
+    bkg_box_lr: int = 32                 # photutils Background2D mesh size on the detector grid
+
+
+def plate_scales(tel: TelescopeConfig, cam: CameraConfig, sim: SimConfig):
+    """Detector (LR) and HR pixel scales in arcsec/px from optics: p = 206265 * pixel / focal length."""
+    p_lr = ARCSEC_PER_RAD * cam.pixel_um * 1e-6 / tel.focal_length_m
+    return p_lr, p_lr / sim.upscale
+
+
+def collecting_area_cm2(tel: TelescopeConfig) -> float:
+    """Clear aperture: primary minus central obstruction minus spider-vane shadows."""
+    d = tel.aperture_m * 100.0
+    area = 0.25 * math.pi * d**2 * (1.0 - tel.obstruction_ratio**2)
+    vane_len = 0.5 * d * (1.0 - tel.obstruction_ratio)
+    return area - tel.n_spider_vanes * vane_len * tel.spider_width_m * 100.0
+
+
+TEL, CAM, SITE, MOUNT, SIM = TelescopeConfig(), CameraConfig(), SiteConfig(), MountConfig(), SimConfig()
+P_LR, P_HR = plate_scales(TEL, CAM, SIM)
+print(f"LR (detector) scale {P_LR:.3f}\"/px, HR scale {P_HR:.3f}\"/px, collecting area {collecting_area_cm2(TEL):.1f} cm^2")
+
+# %% [markdown]
+# ## 1 · Data sourcing: HST ground truth from MAST / HLA
+#
+# * Only targets that clear 30° altitude from Lahore (latitude 31.55° N) are kept: the field must be one you could actually shoot.
+#   Dense stellar fields (globular clusters) give the point-source metrics many stars. Nebulae and galaxies teach the network
+#   not to sharpen diffuse structure into fake stars.
+# * Calibrated, drizzled level-3 products (`*_drz.fits`, `*_drc.fits`) are in **e⁻/s**. `PHOTFLAM` (erg s⁻¹ cm⁻² Å⁻¹ per e⁻/s) and
+#   `PHOTPLAM` (pivot wavelength, Å) turn them into physical photon fluxes. `PHOTBW` is the RMS bandwidth; for a top-hat-like
+#   filter the rectangular width is √12 × RMS. The *same* rectangle is used later to integrate the skyglow spectrum, so the
+#   star-to-sky ratio is self-consistent even where the HST band is not exactly rectangular.
+
+# %%
+# Targets that rise at least 30 deg above the Lahore horizon (max altitude = 90 - |lat - dec|).
+LAHORE_TARGETS = ("M13", "M92", "M3", "M5", "M15", "M2", "M4", "M16", "M42", "M51",
+                  "M101", "M81", "M82", "M27", "M57", "M1", "M31", "M33", "NGC 7331", "NGC 6543")
+HST_FILTERS = ("F435W", "F475W", "F555W", "F606W", "F625W", "F775W", "F814W",
+               "F502N", "F656N", "F657N", "F658N", "F673N")
+
+
+def max_altitude_deg(dec_deg: float, lat_deg: float) -> float:
+    return 90.0 - abs(lat_deg - dec_deg)
+
+
+def query_hst_deep_sky(targets=LAHORE_TARGETS, *, collection: str = "HST",
+                       instruments=("ACS/WFC", "WFC3/UVIS"), filters=HST_FILTERS,
+                       radius: str = "4 arcmin", min_exptime_s: float = 300.0,
+                       per_target: int = 2, site: SiteConfig = SITE) -> Table:
+    """Query MAST for deep, public, calibrated HST imaging of each target.
+
+    collection="HST" returns pipeline + Hubble Advanced Products drizzles; collection="HLA" returns Hubble Legacy Archive
+    products. Results are sorted deepest-first, because deeper exposures give a cleaner ground truth after binning.
+    """
+    from astroquery.mast import Observations
+
+    picked = []
+    for name in targets:
+        try:
+            obs = Observations.query_criteria(
+                objectname=name, radius=radius, obs_collection=collection,
+                dataproduct_type="image", instrument_name=list(instruments),
+                calib_level=3, t_exptime=[min_exptime_s, 1e6],
+                intentType="science", dataRights="PUBLIC")
+        except Exception as exc:                       # name-resolver or network hiccup: skip, don't kill the batch
+            warnings.warn(f"MAST query failed for {name!r}: {exc}")
+            continue
+        if len(obs) == 0:
+            continue
+        # The 'filters' field can be compound ("F814W;CLEAR2L"), so match on the components.
+        has_filter = np.array([any(f in str(s).upper().split(";") for f in filters) for s in obs["filters"]])
+        rises = np.array([max_altitude_deg(float(d), site.latitude_deg) >= site.min_altitude_deg for d in obs["s_dec"]])
+        obs = obs[has_filter & rises]
+        if len(obs):
+            obs.sort("t_exptime", reverse=True)
+            picked.append(obs[:per_target])
+            print(f"{name:>9}: {len(obs):3d} usable observations, deepest {float(obs['t_exptime'][0]):.0f} s")
+    return vstack(picked) if picked else Table()
+
+
+def download_drizzled_products(obs_table: Table, download_dir: str = "hst_cache", *, max_file_mb: float = 700.0,
+                               prefer_cte_corrected: bool = True, one_per_obs: bool = True) -> list[str]:
+    """Download one combined drizzled science image per queried observation. Returns local FITS paths.
+
+    Filters on filename because HST, HAP and HLA products label product subgroups differently, but they all end in
+    _drz.fits or _drc.fits. HAP 'total' detection images (multi-filter sums) are dropped: they have no single bandpass.
+    one_per_obs: an observation's product list also contains member products, e.g. HAP single-exposure drizzles, which
+    still carry cosmic rays and would multiply the simulation work by the number of exposures. Keep only the file named
+    after the observation itself, or failing that the shortest-named (combined) product, then the largest.
+    """
+    from astroquery.mast import Observations
+
+    if len(obs_table) == 0:
+        return []
+    prods = Observations.get_product_list(obs_table)
+    fn = np.char.lower(np.asarray(prods["productFilename"], dtype=str))
+    is_drz = np.char.endswith(fn, "_drz.fits")
+    is_drc = np.char.endswith(fn, "_drc.fits")
+    keep = (is_drz | is_drc) & (np.char.find(fn, "_total_") < 0)
+    keep &= np.asarray(prods["productType"], dtype=str) == "SCIENCE"
+    keep &= np.asarray(prods["size"], dtype=float) < max_file_mb * 1e6
+    if prefer_cte_corrected:                            # drc = CTE-corrected; drop the drz twin when both exist
+        drc_stems = {f[:-9] for f in fn[keep & is_drc]}
+        keep &= ~(is_drz & np.isin(np.char.replace(fn, "_drz.fits", ""), list(drc_stems)))
+    sel = prods[keep]
+    if one_per_obs and len(sel):
+        names = np.char.lower(np.asarray(sel["productFilename"], dtype=str))
+        parent = np.asarray(sel["parent_obsid"]).astype(str) if "parent_obsid" in sel.colnames else None
+        chosen = []
+        for row in obs_table:
+            members = [i for i in range(len(sel)) if parent is None or parent[i] == str(row["obsid"])]
+            if not members:
+                continue
+            own = [i for i in members if names[i].startswith(str(row["obs_id"]).lower() + "_dr")]
+            chosen.append(min(own or members, key=lambda i: (len(names[i]), -float(sel["size"][i]))))
+        sel = sel[sorted(set(chosen))]
+    print(f"Downloading {len(sel)} drizzled products (~{np.sum(sel['size']) / 1e9:.2f} GB) to {download_dir}/")
+    manifest = Observations.download_products(sel, download_dir=download_dir, cache=True)
+    return [str(p) for p in manifest["Local Path"] if Path(str(p)).exists()]
+
+
+def load_hst_drizzled(path: str) -> dict:
+    """Read a drizzled HST image and the metadata needed for physical flux conversion.
+
+    Returns data in e-/s, a validity mask (NaN / zero-weight pixels: chip gaps, mosaic edges), and photometric keywords.
+    PHOT* keywords live in the SCI header for most products and in the primary header for some older ones.
+    """
+    with fits.open(path, memmap=False) as hdul:
+        sci = hdul["SCI"] if "SCI" in hdul else next(h for h in hdul if h.data is not None and h.data.ndim == 2)
+        data = np.asarray(sci.data, dtype=np.float64)
+        sci_hdr, pri_hdr = sci.header, hdul[0].header
+        wht = np.asarray(hdul["WHT"].data) if "WHT" in hdul else None
+
+        def kw(key, default=None):
+            for h in (sci_hdr, pri_hdr):
+                if key in h and h[key] not in (None, ""):
+                    return h[key]
+            return default
+
+        bunit = str(kw("BUNIT", "ELECTRONS/S")).upper()
+        if "/S" not in bunit:                           # counts -> count rate
+            data = data / float(kw("EXPTIME", 1.0))
+        photflam, photplam = kw("PHOTFLAM"), kw("PHOTPLAM")
+        if not photflam or not photplam:
+            raise ValueError(f"{path}: missing PHOTFLAM/PHOTPLAM, cannot convert to physical flux")
+        photbw = kw("PHOTBW") or 0.1 * float(photplam) / math.sqrt(12.0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FITSFixedWarning)
+            pixscale = float(np.mean(proj_plane_pixel_scales(WCS(sci_hdr, naxis=2)))) * 3600.0
+        filt = [str(kw(k)) for k in ("FILTER", "FILTER1", "FILTER2")
+                if kw(k) and not str(kw(k)).upper().startswith("CLEAR")]
+        dec = kw("DEC_TARG", kw("CRVAL2", 0.0))
+
+    mask = ~np.isfinite(data)
+    if wht is not None and wht.shape == data.shape:
+        mask |= ~(wht > 0)
+    data[mask] = 0.0
+    return dict(data=data, mask=mask, pixscale=pixscale, photflam=float(photflam), photplam=float(photplam),
+                photbw=float(photbw), dec_deg=float(dec), filter=filt[0] if filt else "UNKNOWN", path=str(path))
+
+
+def make_hr_truth(meta: dict, p_hr_target: float = P_HR) -> dict:
+    """Flux-conserving block sum from HST's native ~0.04-0.05"/px to the HR grid.
+
+    Binning by an integer factor keeps flux exact and avoids interpolation kernels. HST's own PSF (~0.08") becomes sub-pixel,
+    so the binned image is effectively a perfect sky. The achieved p_hr is returned and used by every later step. ACS 0.05" x 12
+    and WFC3/UVIS 0.04" x 15 both land exactly on 0.6".
+    """
+    f = max(1, int(round(p_hr_target / meta["pixscale"])))
+    ny, nx = (np.array(meta["data"].shape) // f) * f
+    hr = block_reduce(meta["data"][:ny, :nx], f, func=np.sum)
+    bad = block_reduce(meta["mask"][:ny, :nx].astype(np.float64), f, func=np.sum) > 0
+    p_hr = f * meta["pixscale"]
+    if abs(p_hr / p_hr_target - 1) > 0.03:
+        warnings.warn(f"achieved HR scale {p_hr:.3f}\" differs from requested {p_hr_target:.3f}\"")
+    out = {k: v for k, v in meta.items() if k not in ("data", "mask")}
+    out.update(hr_rate=hr, hr_mask=bad, p_hr=p_hr, bin_factor=f)
+    return out
+
+
+def hst_rate_to_amateur_electrons(rate_e_s: np.ndarray, meta: dict, tel: TelescopeConfig,
+                                  cam: CameraConfig, exposure_s: float) -> np.ndarray:
+    """HST e-/s -> electrons collected by the amateur system *above the atmosphere* in one exposure.
+
+    f_lambda = rate * PHOTFLAM                         [erg s^-1 cm^-2 A^-1]
+    N_phot   = f_lambda / (h c / lambda_pivot)         [photons s^-1 cm^-2 A^-1]
+    N_e      = N_phot * W_rect * A_clear * eta * t     [electrons]   (flat-spectrum approximation inside the band)
+    """
+    e_photon = H_CGS * C_CGS / (meta["photplam"] * 1e-8)
+    w_rect_angstrom = math.sqrt(12.0) * meta["photbw"]
+    eta = tel.optical_throughput * cam.qe
+    return rate_e_s * (meta["photflam"] / e_photon) * w_rect_angstrom * collecting_area_cm2(tel) * eta * exposure_s
+
+
+def band_of(meta: dict) -> tuple[float, float]:
+    """(centre, rectangular width) of the bandpass in nm."""
+    return meta["photplam"] / 10.0, math.sqrt(12.0) * meta["photbw"] / 10.0
+
+
+def sample_valid_tile(hr_rate: np.ndarray, hr_mask: np.ndarray, tile: int, rng: np.random.Generator,
+                      multiple_of: int = SIM.upscale, max_tries: int = 500):
+    """Random fully-valid tile (no chip gap / edge pixels). The tile includes the convolution margin."""
+    tile -= tile % multiple_of
+    ny, nx = hr_rate.shape
+    if ny < tile or nx < tile:
+        return None
+    for _ in range(max_tries):
+        y0, x0 = rng.integers(0, ny - tile + 1), rng.integers(0, nx - tile + 1)
+        y0 -= y0 % multiple_of
+        x0 -= x0 % multiple_of
+        if not hr_mask[y0:y0 + tile, x0:x0 + tile].any():
+            return (slice(y0, y0 + tile), slice(x0, x0 + tile))
+    return None
+
+# %% [markdown]
+# ## 2 · Lahore degradation pipeline
+#
+# Forward model for one sub-exposure (electrons):
+#
+# $$\text{LR} = \mathcal{D}\Big[\,\mathcal{B}_s\big( T(\lambda, X)\, S \ast \mathrm{PSF}_{\rm atm} \ast K_{\rm mount}\big) + B_{\rm sky}(x,y) + d\,t\Big]$$
+#
+# where $S$ is the HST sky in amateur electrons, $T$ the band-averaged atmospheric transmission at airmass $X$, $\mathcal{B}_s$
+# the detector's pixel integration (block sum by `upscale`), and $\mathcal{D}$ Poisson + read noise + full-well + ADC.
+#
+# **2a · Extinction.** Rayleigh (Hansen & Travis 1974, scaled to Lahore's 217 m), aerosols via Ångström's law
+# $\tau_a(\lambda)=\tau_{550}(\lambda/550\,\mathrm{nm})^{-\alpha}$, and the ozone Chappuis band. Smog (fine-mode, α ≈ 1.3)
+# reddens starlight much more strongly than dust (coarse-mode, α ≈ 0.4); the regime sampler keeps that correlation.
+#
+# **A note on aerosol "glow" around stars.** Single-scattering into a small cone of half-angle θ scales as
+# $\tau_a X\,P_{\rm HG}(0)\,\pi\theta^2$. With Lahore's asymmetry g≈0.72, $P_{\rm HG}(0)\approx1.6$ sr⁻¹, so for a whole
+# 0.5° field the scattered-in fraction is ~4×10⁻⁴·τX, a flat pedestal indistinguishable from sky. Haze halos you see
+# by eye are degree-scale. So at these field sizes, smog acts through **extinction and skyglow**, not a PSF halo, and it is
+# modelled that way.
+
+# %%
+def airmass_pickering(alt_deg):
+    """Pickering (2002) airmass, accurate to the horizon."""
+    h = np.clip(np.asarray(alt_deg, dtype=float), 0.5, 90.0)
+    return 1.0 / np.sin(np.radians(h + 244.0 / (165.0 + 47.0 * h**1.1)))
+
+
+def tau_rayleigh(lam_nm, elevation_m: float = SITE.elevation_m):
+    lam = np.asarray(lam_nm) / 1000.0
+    return 0.008569 * lam**-4 * (1.0 + 0.0113 * lam**-2 + 0.00013 * lam**-4) * math.exp(-elevation_m / 8434.0)
+
+
+def tau_aerosol(lam_nm, aod550: float, angstrom: float):
+    return aod550 * (np.asarray(lam_nm) / 550.0) ** (-angstrom)
+
+
+def tau_ozone(lam_nm, ozone_du: float = SITE.ozone_du):
+    # Chappuis band: peak cross-section ~5.2e-21 cm^2 near 603 nm -> tau ~0.042 per 300 DU.
+    return 0.042 * (ozone_du / 300.0) * np.exp(-0.5 * ((np.asarray(lam_nm) - 603.0) / 70.0) ** 2)
+
+
+def tau_total(lam_nm, aod550, angstrom, site: SiteConfig = SITE):
+    return tau_rayleigh(lam_nm, site.elevation_m) + tau_aerosol(lam_nm, aod550, angstrom) + tau_ozone(lam_nm, site.ozone_du)
+
+
+def band_grid(lam_c_nm: float, width_nm: float, n: int = 96):
+    return np.linspace(lam_c_nm - 0.5 * width_nm, lam_c_nm + 0.5 * width_nm, n)
+
+
+def band_transmission(lam_c_nm, width_nm, airmass, aod550, angstrom, site: SiteConfig = SITE) -> float:
+    """Photon-weighted mean of exp(-tau(lambda) X) across the band (flat source spectrum, as in the flux conversion)."""
+    lam = band_grid(lam_c_nm, width_nm)
+    return float(np.mean(np.exp(-tau_total(lam, aod550, angstrom, site) * airmass)))
+
+# %% [markdown]
+# **2b · Bortle 8/9 skyglow: spectrum and gradient.**
+#
+# *Spectrum.* City light is a mix of phosphor-converted white LEDs (blue pump at 450 nm plus a broad phosphor hump) and
+# high-pressure sodium (self-reversed Na D wings around 589 nm plus lines at 569, 616 and 819 nm). It reaches the zenith after
+# scattering at roughly 90°, so the spectral weight is $\tau_R P_R(90°) + \omega_0\tau_a P_{HG}(90°;g)$, attenuated by one
+# effective airmass. The absolute level is pinned to the zenith V-band brightness `mu_v`; each HST band's sky rate then
+# follows from the spectrum. Narrowband Hα gets a dark sky and F555W a bright one, as in practice.
+#
+# *Gradient.* Brightness versus altitude/azimuth = optically-thick path term $(1-e^{-\tau X})/(1-e^{-\tau})$ (it saturates in
+# heavy smog, so smoggy skies are brighter **and** flatter) × a light dome toward the city centre. It is evaluated over the
+# **full sensor**, with the HST field placed at a random position on it. A 3′ HST field therefore sees only a gentle, nearly
+# planar slice (~1-3 %) of a gradient that spans tens of percent across the frame. That is physically correct, and it is also
+# why background removal (`estimate_background`) runs on the frame **before** the network: SRCNN's 17-px receptive field
+# cannot see a gradient anyway.
+
+# %%
+def _g(x, mu, sig):
+    return np.exp(-0.5 * ((x - mu) / sig) ** 2)
+
+
+_LAMP_GRID = np.linspace(350.0, 1000.0, 2601)
+
+
+def lamp_photon_spectrum(lam_nm, led_fraction: float):
+    """Schematic photon spectra (each normalised to unit integral over 350-1000 nm)."""
+    def led(l):   # ~4000 K pc-LED
+        return 0.30 * _g(l, 450, 9) + _g(l, 585, 50)
+
+    def hps(l):   # high-pressure sodium
+        return (0.9 * _g(l, 582, 5) + 1.0 * _g(l, 597, 6) + 0.45 * _g(l, 569, 2) +
+                0.40 * _g(l, 616, 2) + 0.35 * _g(l, 819, 3) + 0.10 * _g(l, 498, 2))
+
+    led_n, hps_n = _trapz(led(_LAMP_GRID), _LAMP_GRID), _trapz(hps(_LAMP_GRID), _LAMP_GRID)
+    return led_fraction * led(lam_nm) / led_n + (1.0 - led_fraction) * hps(lam_nm) / hps_n
+
+
+def hg_phase(theta, g):
+    return (1 - g * g) / (4 * np.pi * (1 + g * g - 2 * g * np.cos(theta)) ** 1.5)
+
+
+def rayleigh_phase(theta):
+    return 3.0 / (16.0 * np.pi) * (1.0 + np.cos(theta) ** 2)
+
+
+def skyglow_spectral_shape(lam_nm, aod550, angstrom, led_fraction, site: SiteConfig = SITE):
+    th = np.pi / 2
+    scatter = (tau_rayleigh(lam_nm, site.elevation_m) * rayleigh_phase(th) +
+               site.aerosol_ssa * tau_aerosol(lam_nm, aod550, angstrom) * hg_phase(th, site.aerosol_asymmetry_g))
+    return lamp_photon_spectrum(lam_nm, led_fraction) * scatter * np.exp(-tau_total(lam_nm, aod550, angstrom, site))
+
+
+def ab_photon_flux_density(mag, lam_nm):
+    """AB magnitude -> photons s^-1 cm^-2 A^-1 (per arcsec^2 if mag is a surface brightness)."""
+    f_nu = 10.0 ** (-0.4 * (mag + 48.60))
+    return f_nu / (H_CGS * np.asarray(lam_nm) * 1e-7) * 1e-8
+
+
+V_BAND_NM = (507.0, 595.0)
+
+
+def sky_rate_zenith(lam_c_nm, width_nm, mu_v, aod550, angstrom, led_fraction, p_lr,
+                    tel=TEL, cam=CAM, site=SITE) -> float:
+    """Zenith skyglow in e- s^-1 per detector pixel, in the given band."""
+    lv = np.linspace(*V_BAND_NM, 256)
+    k = (_trapz(ab_photon_flux_density(mu_v, lv), lv * 10) /
+         _trapz(skyglow_spectral_shape(lv, aod550, angstrom, led_fraction, site), lv * 10))
+    lb = band_grid(lam_c_nm, width_nm, 256)
+    n_band = k * _trapz(skyglow_spectral_shape(lb, aod550, angstrom, led_fraction, site), lb * 10)  # ph s^-1 cm^-2 arcsec^-2
+    return n_band * collecting_area_cm2(tel) * tel.optical_throughput * cam.qe * p_lr**2
+
+
+def sky_gradient_map(frame_shape, p_lr, cond: dict, site: SiteConfig = SITE):
+    """Relative sky brightness (zenith = 1) for each pixel of a frame embedded in the full sensor.
+
+    Sensor orientation: +y points to position angle cond['camera_pa_deg'] (east of north), +x is +y rotated clockwise.
+    The zenith direction on the sky has position angle = parallactic angle q.
+    """
+    ny, nx = frame_shape
+    yy, xx = np.mgrid[0:ny, 0:nx].astype(float)
+    oy, ox = cond["frame_offset_px"]
+    dx = (xx - (nx - 1) / 2 + ox) * p_lr / 3600.0     # degrees on the sky from the sensor centre
+    dy = (yy - (ny - 1) / 2 + oy) * p_lr / 3600.0
+    rel = math.radians(cond["parallactic_deg"] - cond["camera_pa_deg"])
+    d_alt = -dx * math.sin(rel) + dy * math.cos(rel)  # along the zenith direction
+    d_hor = dx * math.cos(rel) + dy * math.sin(rel)   # along increasing azimuth
+    alt = np.clip(cond["alt_deg"] + d_alt, 1.0, 90.0)
+    az = cond["az_deg"] + d_hor / max(math.cos(math.radians(cond["alt_deg"])), 0.05)
+
+    tau_s = float(tau_rayleigh(550.0, site.elevation_m) + site.aerosol_ssa * tau_aerosol(550.0, cond["aod550"], cond["angstrom"]))
+
+    def brightness(a, z):
+        path = -np.expm1(-tau_s * airmass_pickering(a)) / -np.expm1(-tau_s)
+        daz = (z - cond["dome_az_deg"] + 180.0) % 360.0 - 180.0
+        dome = 1.0 + cond["dome_amplitude"] * np.exp(-a / site.light_dome_scale_height_deg) * \
+            np.exp(-0.5 * (daz / site.light_dome_width_deg) ** 2)
+        return path * dome
+
+    return brightness(alt, az) / brightness(90.0, cond["dome_az_deg"])
+
+# %% [markdown]
+# **2c · Seeing from Kolmogorov / von Kármán turbulence (`aotools`).**
+#
+# * $r_0$ is set from DIMM-convention seeing $\epsilon = 0.98\lambda/r_0$ at 500 nm and zenith, then scaled as
+#   $r_0 \propto \lambda^{6/5}(\cos z)^{3/5}$.
+# * Each screen comes from `ft_sh_phase_screen` (FFT plus **subharmonics**). For a 13 cm aperture the PSF width is dominated by
+#   tip-tilt, which lives at scales between the grid size and $L_0$. A plain FFT screen misses those scales and gives
+#   stars that are too sharp.
+# * A 30-120 s exposure averages thousands of independent turbulence realisations, so the target is the **long-exposure** PSF.
+#   Averaging finitely many screens leaves random anisotropy in the tilt covariance, which would leak a *fake ellipticity* into
+#   the metrics. Each screen is therefore used at 0°, 90°, 180° and 270°. Isotropic turbulence makes all four equally valid,
+#   the 4-vane pupil is invariant under 90° rotation, and the averaged PSF has exactly isotropic second moments.
+# * Sampling: the PSF is computed at an odd oversampling of the HR grid chosen to Nyquist-sample λ/D, then block-summed
+#   (pixel integration). An odd factor keeps the PSF peak on a pixel centre, so the PSF introduces no sub-pixel shift between
+#   input and target.
+
+# %%
+def make_pupil(n: int, delta_m: float, tel: TelescopeConfig) -> np.ndarray:
+    """Clear aperture with central obstruction and anti-aliased spider vanes."""
+    pupil = aotools.circle(0.5 * tel.aperture_m / delta_m, n).astype(float)
+    if tel.obstruction_ratio > 0:
+        pupil -= aotools.circle(0.5 * tel.obstruction_ratio * tel.aperture_m / delta_m, n)
+    if tel.n_spider_vanes > 0 and tel.spider_width_m > 0:
+        c = (np.arange(n) - (n - 1) / 2) * delta_m
+        X, Y = np.meshgrid(c, c)
+        for k in range(tel.n_spider_vanes):
+            a = math.radians(tel.spider_angle_deg) + 2 * math.pi * k / tel.n_spider_vanes
+            along = X * math.cos(a) + Y * math.sin(a)
+            perp = np.abs(-X * math.sin(a) + Y * math.cos(a))
+            cover = np.clip(0.5 + (0.5 * tel.spider_width_m - perp) / delta_m, 0, 1) * (along > 0)
+            pupil *= 1.0 - cover
+    return np.clip(pupil, 0, 1)
+
+
+@functools.lru_cache(maxsize=96)
+def _long_exposure_psf(lam_nm: float, r0_m: float, L0_m: float, l0_m: float, p_hr: float,
+                       tel: TelescopeConfig, n_fft: int, n_screens: int, energy_crop: float, seed: int) -> np.ndarray:
+    lam = lam_nm * 1e-9
+    p_nyq = lam / (2 * tel.aperture_m) * ARCSEC_PER_RAD          # Nyquist pixel for the diffraction pattern ["]
+    os_ = max(1, math.ceil(p_hr / p_nyq))
+    os_ += (os_ % 2 == 0)                                          # odd -> PSF peak lands on an HR pixel centre
+    delta = lam / ((p_hr / os_) / ARCSEC_PER_RAD * n_fft)          # pupil sampling so one FFT pixel = p_hr/os_
+    pupil = make_pupil(n_fft, delta, tel)
+
+    rng = np.random.default_rng(seed)
+    acc = np.zeros((n_fft, n_fft))
+    for _ in range(n_screens):
+        phs = ft_sh_phase_screen(r0_m, n_fft, delta, L0_m, l0_m, seed=int(rng.integers(2**31 - 1)))
+        for k in range(4):                                         # 4-fold rotation averaging (see markdown)
+            acc += np.abs(np.fft.fftshift(np.fft.fft2(pupil * np.exp(1j * np.rot90(phs, k))))) ** 2
+
+    m = (n_fft - 1) // os_
+    m -= (m % 2 == 0)
+    half, c = (os_ * m - 1) // 2, n_fft // 2
+    psf = acc[c - half:c + half + 1, c - half:c + half + 1].reshape(m, os_, m, os_).sum(axis=(1, 3))
+    psf /= psf.sum()
+
+    # Crop to the requested encircled energy, then renormalise: total flux is conserved and convolution margins stay small.
+    yy, xx = np.indices(psf.shape) - m // 2
+    r = np.hypot(xx, yy).ravel()
+    order = np.argsort(r)
+    r_cut = r[order][np.searchsorted(np.cumsum(psf.ravel()[order]), energy_crop)]
+    h = min(m // 2, int(math.ceil(r_cut)) + 1)
+    psf = psf[m // 2 - h:m // 2 + h + 1, m // 2 - h:m // 2 + h + 1]
+    psf = psf / psf.sum()
+    psf.setflags(write=False)
+    return psf
+
+
+def r0_from_seeing(seeing_arcsec: float, lam_nm: float = 500.0) -> float:
+    return 0.98 * lam_nm * 1e-9 / (seeing_arcsec / ARCSEC_PER_RAD)
+
+
+def seeing_psf(lam_nm: float, seeing_500_zenith_arcsec: float, alt_deg: float, p_hr: float,
+               tel: TelescopeConfig = TEL, site: SiteConfig = SITE, sim: SimConfig = SIM, seed: int = 0) -> np.ndarray:
+    """Long-exposure atmospheric + telescope PSF on the HR grid (sum = 1). Cached on a ~3 % grid in r0."""
+    zen = math.radians(90.0 - alt_deg)
+    r0 = r0_from_seeing(seeing_500_zenith_arcsec) * (lam_nm / 500.0) ** 1.2 * math.cos(zen) ** 0.6
+    q = sim.psf_r0_bin_frac
+    r0_q = float(math.exp(round(math.log(r0) / q) * q))
+    return _long_exposure_psf(float(round(lam_nm / 5) * 5), r0_q, float(site.outer_scale_m), float(site.inner_scale_m),
+                              float(round(p_hr, 4)), tel, sim.psf_fft_size, sim.psf_n_screens, sim.psf_energy_crop, seed)
+
+
+def analytic_long_exposure_psf(lam_nm: float, r0_m: float, L0_m: float, p_hr: float,
+                               tel: TelescopeConfig = TEL, n_fft: int = 256) -> np.ndarray:
+    """Independent check of the Monte Carlo PSF: the exact long-exposure result (Fried 1966),
+    OTF = OTF_telescope(f) * exp(-D_phi(lambda f) / 2), with the von Kármán phase structure function
+    D_phi(r) = 0.17253 (L0/r0)^(5/3) [1 - 2^(1/6)/Gamma(5/6) * x^(5/6) K_(5/6)(x)], x = 2 pi r / L0.
+    Same sampling and binning as _long_exposure_psf, so the two can be compared pixel for pixel."""
+    lam = lam_nm * 1e-9
+    os_ = max(1, math.ceil(p_hr / (lam / (2 * tel.aperture_m) * ARCSEC_PER_RAD)))
+    os_ += (os_ % 2 == 0)
+    delta = lam / ((p_hr / os_) / ARCSEC_PER_RAD * n_fft)
+    pupil = make_pupil(n_fft, delta, tel)
+    otf_tel = np.fft.ifft2(np.abs(np.fft.fft2(pupil)) ** 2)            # pupil autocorrelation, origin at [0, 0]
+    sep = np.fft.fftfreq(n_fft) * n_fft * delta
+    r = np.maximum(np.hypot(*np.meshgrid(sep, sep)), 1e-12)
+    x = 2 * np.pi * r / L0_m
+    d_phi = 0.17253 * (L0_m / r0_m) ** (5 / 3) * (1 - 2 ** (1 / 6) / special.gamma(5 / 6) * x ** (5 / 6) * special.kv(5 / 6, x))
+    psf = np.abs(np.fft.fftshift(np.fft.fft2(otf_tel * np.exp(-0.5 * d_phi))))
+    m = (n_fft - 1) // os_
+    m -= (m % 2 == 0)
+    half, c = (os_ * m - 1) // 2, n_fft // 2
+    psf = psf[c - half:c + half + 1, c - half:c + half + 1].reshape(m, os_, m, os_).sum(axis=(1, 3))
+    return psf / psf.sum()
+
+# %% [markdown]
+# **2d · Tracking errors of a home-built mount.**
+# The pointing error over one exposure is integrated as a time series, then turned into a blur kernel:
+#
+# | term | physics | axis |
+# |---|---|---|
+# | periodic error | worm eccentricity: fundamental + 2nd/3rd harmonic, random phase in the worm cycle | RA (× cos δ on sky) |
+# | rate error | microstep quantisation / clock error in the sidereal rate | RA |
+# | polar misalignment | drift velocity $\omega_\oplus\,\boldsymbol\epsilon\times\hat{\mathbf s}$ for axis error ε at position angle ψ, projected on E/N at the target's hour angle | both |
+# | random walk | gear-tooth irregularity, belt creep | both |
+# | jitter | stepper resonance, mirror vibration (white) | RA, ½ in Dec |
+# | jumps | cable snag, wind gust, backlash (Poisson) | random |
+#
+# The trajectory is mean-subtracted before splatting, because registration in stacking aligns on the time-averaged
+# centroid. Bilinear splatting preserves both flux and centroid exactly.
+
+# %%
+def mount_trajectory(rng: np.random.Generator, mount: MountConfig, exposure_s: float,
+                     dec_deg: float, ha_rad: float, pe_phase: float | None = None):
+    """Pointing error (east, north) in arcsec on the sky, sampled every mount.dt_s."""
+    t = np.arange(0.0, exposure_s, mount.dt_s)
+    n = t.size
+    cosd, sind = math.cos(math.radians(dec_deg)), math.sin(math.radians(dec_deg))
+
+    amp = rng.uniform(*mount.pe_amplitude_arcsec_range)
+    ph0 = rng.uniform(0, 2 * np.pi) if pe_phase is None else pe_phase
+    w = 2 * np.pi / mount.worm_period_s
+    pe = amp * np.sin(w * t + ph0)
+    for k, r in enumerate(mount.pe_harmonic_ratios, start=2):
+        pe += amp * r * np.sin(k * w * t + rng.uniform(0, 2 * np.pi))
+    rate = rng.uniform(*mount.rate_error_frac_range) * SIDEREAL_RATE_ARCSEC_S * t
+    east = (pe - pe[0] + rate) * cosd                       # RA-axis angle -> great-circle arcsec
+
+    # Polar-axis error vector ε (perpendicular to the pole) and star unit vector s in hour-angle coordinates.
+    eps = math.radians(rng.uniform(*mount.polar_error_arcmin_range) / 60.0)
+    psi = rng.uniform(0, 2 * np.pi)
+    s = np.array([cosd * math.cos(ha_rad), -cosd * math.sin(ha_rad), sind])
+    v = OMEGA_SIDEREAL * np.cross(eps * np.array([math.cos(psi), math.sin(psi), 0.0]), s) * ARCSEC_PER_RAD
+    e_hat = np.array([math.sin(ha_rad), math.cos(ha_rad), 0.0])
+    n_hat = np.array([-sind * math.cos(ha_rad), sind * math.sin(ha_rad), cosd])
+    east = east + float(v @ e_hat) * t
+    north = float(v @ n_hat) * t
+
+    rw = np.cumsum(rng.normal(0.0, mount.random_walk_arcsec_per_sqrt_s * math.sqrt(mount.dt_s), (2, n)), axis=1)
+    east = east + rw[0] + rng.normal(0.0, mount.jitter_rms_arcsec, n)
+    north = north + rw[1] + rng.normal(0.0, 0.5 * mount.jitter_rms_arcsec, n)
+
+    for _ in range(rng.poisson(mount.jump_rate_per_exposure)):
+        t_j, size, ang = rng.uniform(0, exposure_s), rng.exponential(mount.jump_mean_arcsec), rng.uniform(0, 2 * np.pi)
+        east = east + (t >= t_j) * size * math.cos(ang)
+        north = north + (t >= t_j) * size * math.sin(ang)
+    return t, east, north
+
+
+def sky_to_sensor(east, north, camera_pa_deg: float):
+    """(E, N) on the sky -> (x, y) on the sensor (+y at PA camera_pa_deg, east-left parity)."""
+    th = math.radians(camera_pa_deg)
+    x = -east * math.cos(th) + north * math.sin(th)
+    y = east * math.sin(th) + north * math.cos(th)
+    return x, y
+
+
+def trajectory_to_kernel(x_px: np.ndarray, y_px: np.ndarray) -> np.ndarray:
+    """Time-weighted blur kernel from a trajectory (bilinear splatting; sum = 1; centroid at the centre pixel)."""
+    x, y = x_px - x_px.mean(), y_px - y_px.mean()
+    half = int(math.ceil(max(np.abs(x).max(), np.abs(y).max()))) + 2
+    k = np.zeros((2 * half + 1, 2 * half + 1))
+    fx, fy = x + half, y + half
+    x0, y0 = np.floor(fx).astype(int), np.floor(fy).astype(int)
+    wx, wy = fx - x0, fy - y0
+    for dy, dx, wgt in ((0, 0, (1 - wx) * (1 - wy)), (0, 1, wx * (1 - wy)), (1, 0, (1 - wx) * wy), (1, 1, wx * wy)):
+        np.add.at(k, (y0 + dy, x0 + dx), wgt)
+    return k / k.sum()
+
+# %% [markdown]
+# **2e · Detector, target PSF and the full forward model.**
+#
+# *Why the target is not the raw HST image.* Binned HST stars are effectively delta functions. Asking a CNN to output those
+# is ill-posed: it rewards ringing and hallucinated point sources, and the FWHM metric degenerates because an undersampled star
+# has no measurable width. The target is therefore the HST sky convolved with a **Nyquist-sampled Gaussian (FWHM = 2 HR px =
+# 1.2″)**, roughly the diffraction limit of a 10-13 cm telescope: the best image this hardware could form without an atmosphere.
+#
+# *Why the target keeps the extinction* (`target_includes_extinction=True`). Grey and coloured extinction is a global
+# multiplicative factor, degenerate with the intrinsic brightness of every source. No local CNN can infer it. That correction
+# belongs to photometric calibration (zero point from Gaia/APASS stars in the frame), not super-resolution. Asking the network
+# to do it would directly violate the flux-conservation requirement.
+
+# %%
+def make_target_psf(fwhm_px: float) -> np.ndarray:
+    """Pixel-integrated circular Gaussian (exact erf integration, sum = 1)."""
+    s = fwhm_px / FWHM_PER_SIGMA
+    half = int(math.ceil(4 * s)) + 1
+    edges = np.arange(-half - 0.5, half + 1.0)
+    k1 = np.diff(special.erf(edges / (s * math.sqrt(2))) / 2)
+    k1 /= k1.sum()
+    return np.outer(k1, k1)
+
+
+def block_sum(a: np.ndarray, s: int) -> np.ndarray:
+    ny, nx = a.shape
+    return a.reshape(ny // s, s, nx // s, s).sum(axis=(1, 3))
+
+
+def detector_readout(expected_e: np.ndarray, cam: CameraConfig, rng: np.random.Generator):
+    """Poisson -> full well -> read noise -> ADC (offset, gain, bit depth) -> back to electrons."""
+    e = rng.poisson(np.clip(expected_e, 0, None)).astype(np.float64)
+    sat = e >= cam.full_well_e
+    e = np.minimum(e, cam.full_well_e) + rng.normal(0.0, cam.read_noise_e, e.shape)
+    adc_max = 2**cam.adc_bits - 1
+    adu = np.round(e / cam.gain_e_per_adu + cam.offset_adu)
+    sat |= adu >= adc_max
+    adu = np.clip(adu, 0, adc_max)
+    return (adu - cam.offset_adu) * cam.gain_e_per_adu, sat
+
+
+def sample_lahore_conditions(rng: np.random.Generator, dec_deg: float, *, site: SiteConfig = SITE,
+                             mount: MountConfig = MOUNT, cam: CameraConfig = CAM, regime: str | None = None) -> dict:
+    """One random Lahore night for a target at declination dec_deg.
+
+    Aerosol regimes follow AERONET-Lahore climatology: annual-mean AOD(500) ≈ 0.68 ± 0.37 (range 0.08-2.91) and
+    Ångström exponent ≈ 0.99 ± 0.33 (Zafar et al. 2018, Int. J. Climatol., doi:10.1002/joc.5230). Winter is dominated by
+    fine urban/biomass-burning smog, spring and summer by coarse dust (Zeb et al. 2024, Sci. Rep., doi:10.1038/s41598-024-58981-0).
+    AERONET is a daytime sun photometer; the night-time boundary layer is shallower, so treat these as priors to tune.
+    """
+    # Weighted mean AOD ≈ 0.75, close to the AERONET annual mean. The tails reach the observed extremes (~2.9) rarely,
+    # and nights above ~2 (more than 2 mag of extinction) are ones nobody images on.
+    regimes = {  # name: (weight, AOD550 median, ln-sigma, Angstrom mean, Angstrom sd)
+        "winter_smog":     (0.35, 0.95, 0.35, 1.30, 0.15),
+        "premonsoon_dust": (0.25, 0.75, 0.35, 0.45, 0.15),
+        "typical":         (0.40, 0.50, 0.40, 1.00, 0.25),
+    }
+    if regime is None:
+        names = list(regimes)
+        regime = names[rng.choice(len(names), p=[regimes[n][0] for n in names])]
+    _, aod_med, aod_sig, ae_mu, ae_sd = regimes[regime]
+    aod550 = float(np.clip(aod_med * math.exp(rng.normal(0, aod_sig)), 0.08, 2.5))
+    angstrom = float(np.clip(rng.normal(ae_mu, ae_sd), 0.05, 1.8))
+
+    # Hour angle drawn uniformly over the arc where the target is above min_altitude.
+    phi, dec = math.radians(site.latitude_deg), math.radians(dec_deg)
+    cos_hmax = (math.sin(math.radians(site.min_altitude_deg)) - math.sin(phi) * math.sin(dec)) / (math.cos(phi) * math.cos(dec))
+    h_max = 0.0 if cos_hmax >= 1 else min(math.acos(max(cos_hmax, -1.0)), math.radians(60.0))
+    ha = rng.uniform(-h_max, h_max)
+    sin_alt = math.sin(phi) * math.sin(dec) + math.cos(phi) * math.cos(dec) * math.cos(ha)
+    alt = math.degrees(math.asin(sin_alt))
+    az = math.degrees(math.atan2(-math.cos(dec) * math.sin(ha),
+                                 math.sin(dec) * math.cos(phi) - math.cos(dec) * math.sin(phi) * math.cos(ha))) % 360
+    q = math.degrees(math.atan2(math.sin(ha), math.tan(phi) * math.cos(dec) - math.sin(dec) * math.cos(ha)))
+
+    return dict(
+        regime=regime, aod550=aod550, angstrom=angstrom,
+        mu_v=float(rng.uniform(*site.mu_v_range)),
+        led_fraction=float(rng.uniform(*site.led_fraction_range)),
+        dome_amplitude=float(rng.uniform(*site.light_dome_amplitude_range)),
+        dome_az_deg=float(rng.uniform(0, 360)),
+        seeing_arcsec=float(np.clip(site.seeing_median_arcsec * math.exp(rng.normal(0, site.seeing_log_sigma)), 1.5, 5.0)),
+        exposure_s=float(rng.uniform(*mount.exposure_s_range)),
+        dec_deg=dec_deg, ha_rad=ha, alt_deg=alt, az_deg=az, parallactic_deg=q,
+        camera_pa_deg=float(rng.uniform(0, 360)),
+        frame_offset_px=(float(rng.uniform(-0.45, 0.45) * cam.sensor_shape[0]),
+                         float(rng.uniform(-0.45, 0.45) * cam.sensor_shape[1])),
+    )
+
+
+def simulate_lahore_frame(hr_rate: np.ndarray, meta: dict, cond: dict, rng: np.random.Generator, *,
+                          hr_invalid: np.ndarray | None = None, tel=TEL, cam=CAM, site=SITE, mount=MOUNT,
+                          sim=SIM, psf_seed: int = 0, noiseless: bool = False) -> dict:
+    """Full forward model for one HR tile (HST e-/s). Returns the LR frame (e-), the HR target, and diagnostics.
+
+    The input tile must be a multiple of sim.upscale. Edges touched by the zero-padded convolution are cropped from all outputs,
+    so the outputs are smaller than the input by 2 x margin. noiseless=True returns expected counts (no Poisson, read noise
+    or ADC) for validating systematics; with the same rng seed it reproduces the same PSF and mount realisation.
+    """
+    s = sim.upscale
+    assert hr_rate.shape[0] % s == 0 and hr_rate.shape[1] % s == 0, "tile must be divisible by upscale"
+    p_hr = meta["p_hr"]
+    p_lr = s * p_hr
+    lam_c, width = band_of(meta)
+    X = float(airmass_pickering(cond["alt_deg"]))
+    T = band_transmission(lam_c, width, X, cond["aod550"], cond["angstrom"], site)
+
+    hr_e = hst_rate_to_amateur_electrons(hr_rate, meta, tel, cam, cond["exposure_s"])   # above the atmosphere
+    hr_atm = T * hr_e                                                                    # after extinction
+
+    psf_atm = np.asarray(seeing_psf(lam_c, cond["seeing_arcsec"], cond["alt_deg"], p_hr, tel, site, sim, psf_seed))
+
+    # Sky (identical in every sub of a short stack), dark current.
+    sky0 = sky_rate_zenith(lam_c, width, cond["mu_v"], cond["aod550"], cond["angstrom"], cond["led_fraction"],
+                           p_lr, tel, cam, site) * cond["exposure_s"]
+    lr_shape = (hr_rate.shape[0] // s, hr_rate.shape[1] // s)
+    sky = sky0 * sky_gradient_map(lr_shape, p_lr, cond, site)
+    dark = cam.dark_e_per_s * cond["exposure_s"]
+
+    # Sub-exposures: each has its own mount trajectory (a different slice of the worm cycle). The mean stack's PSF is the
+    # average of the per-sub PSFs.
+    lr_stack = np.zeros(lr_shape)
+    sat_any = np.zeros(lr_shape, dtype=bool)
+    psf_stack, kernels = None, []
+    worm_phase0 = rng.uniform(0, 2 * np.pi)
+    for i in range(sim.n_subs):
+        pe_phase = worm_phase0 + 2 * np.pi * i * cond["exposure_s"] / mount.worm_period_s
+        _, e_arc, n_arc = mount_trajectory(rng, mount, cond["exposure_s"], cond["dec_deg"], cond["ha_rad"], pe_phase)
+        x_px, y_px = sky_to_sensor(e_arc, n_arc, cond["camera_pa_deg"])
+        k_mount = trajectory_to_kernel(x_px / p_hr, y_px / p_hr)
+        psf_i = signal.fftconvolve(psf_atm, k_mount, mode="full")
+        psf_i = np.clip(psf_i, 0, None)
+        psf_i /= psf_i.sum()
+        hr_blur = np.clip(signal.fftconvolve(hr_atm, psf_i, mode="same"), 0, None)
+        expected = block_sum(hr_blur, s) + sky + dark
+        if noiseless:
+            lr_e, sat = expected, expected >= min(cam.full_well_e, (2**cam.adc_bits - 1 - cam.offset_adu) * cam.gain_e_per_adu)
+        else:
+            lr_e, sat = detector_readout(expected, cam, rng)
+        lr_stack += lr_e - dark                    # master-dark subtraction removes the mean; its shot noise stays
+        sat_any |= sat
+        kernels.append(k_mount)
+        psf_stack = psf_i if psf_stack is None else _add_centered(psf_stack, psf_i)
+    lr_stack /= sim.n_subs
+    psf_stack /= psf_stack.sum()
+
+    target_src = hr_atm if sim.target_includes_extinction else hr_e
+    target = signal.fftconvolve(target_src, make_target_psf(sim.target_fwhm_hr_px), mode="same")
+
+    # Crop the margin contaminated by zero padding; round up to a multiple of s so the grids stay aligned.
+    m_hr = int(math.ceil((psf_stack.shape[0] // 2 + 1) / s)) * s
+    m_lr = m_hr // s
+    crop_hr = (slice(m_hr, -m_hr), slice(m_hr, -m_hr))
+    crop_lr = (slice(m_lr, -m_lr), slice(m_lr, -m_lr))
+    invalid = np.zeros(hr_rate.shape, dtype=bool) if hr_invalid is None else hr_invalid.copy()
+    if invalid.any():                                # masked pixels contaminate everything within one PSF radius
+        invalid = ndimage.binary_dilation(invalid, iterations=psf_stack.shape[0] // 2)
+    invalid_lr = block_sum(invalid.astype(float), s) > 0
+
+    return dict(
+        lr_e=lr_stack[crop_lr], saturated_lr=sat_any[crop_lr], invalid_lr=invalid_lr[crop_lr],
+        target=target[crop_hr], invalid_hr=invalid[crop_hr], sky_true_lr=sky[crop_lr],
+        psf_atm=psf_atm, psf_total=psf_stack, mount_kernels=kernels,
+        transmission=T, airmass=X, p_hr=p_hr, p_lr=p_lr, band_nm=(lam_c, width),
+        sky_e_per_lr_px_zenith=sky0, cond=cond, upscale=s,
+    )
+
+
+def _add_centered(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Sum two odd-sized, centred kernels of different sizes."""
+    n = max(a.shape[0], b.shape[0])
+    out = np.zeros((n, n))
+    for k in (a, b):
+        o = (n - k.shape[0]) // 2
+        out[o:o + k.shape[0], o:o + k.shape[1]] += k
+    return out
+
+# %% [markdown]
+# **2f · From physical frames to network tensors.**
+# 1. Frame-level background removal (photutils `Background2D`, two passes with a dilated source mask). This is the step an
+#    amateur does with DBE / GraXpert, and its residual errors are part of what the network must tolerate.
+# 2. Convert the LR frame to **surface brightness per HR pixel** (÷ upscale²) and bicubically upsample (`align_corners=False`
+#    puts LR pixel centres exactly where the block sum put them). The HR aperture sum of the input then equals the LR flux.
+# 3. Divide input and target by the **same** scalar, the per-LR-pixel noise σ. This is linear, so flux ratios are untouched,
+#    and in these units the input noise is 1 per detector pixel.
+
+# %%
+def estimate_background(img: np.ndarray, box: int, mask: np.ndarray | None = None, psf_fwhm_lr: float = 3.0,
+                        nsigma: float = 2.0, n_iter: int = 3) -> Background2D:
+    """Iterative Background2D with a matched-filter source mask.
+
+    Pixel-level 2.5σ masking leaves star halos and unresolved faint stars in the "sky". In testing that biased the
+    background high by ~0.2σ per pixel, removing ~2 % of each star's flux over a 99 %-energy aperture: the same faint
+    light that gradient-removal tools eat. Thresholding the PSF-smoothed residual at 2σ (of the smoothed noise) masks that
+    light without noise peaks fragmenting the mask. In tests this cut the bias from +0.96 to +0.05 e-/px.
+    """
+    box = int(max(8, min(box, min(img.shape) // 2)))
+    bkg = _background2d(img, box, mask) or _FlatBackground(img, mask)
+    s_k = max(psf_fwhm_lr, 1.0) / FWHM_PER_SIGMA
+    for _ in range(n_iter):
+        smooth = ndimage.gaussian_filter(img - bkg.background, s_k)
+        rms_smooth = bkg.background_rms_median / (2.0 * math.sqrt(math.pi) * s_k)   # white noise through the Gaussian
+        src = ndimage.binary_dilation(smooth > nsigma * rms_smooth, iterations=max(1, int(math.ceil(psf_fwhm_lr))))
+        nxt = _background2d(img, box, src if mask is None else (src | mask))
+        if nxt is None:                                 # crowded/nebular field: too few clean meshes, keep last estimate
+            break
+        bkg = nxt
+    return bkg
+
+
+def _background2d(img, box, mask):
+    """Background2D, relaxing how many masked pixels a mesh may contain (chip gaps, mosaic edges, dense sources)."""
+    kw = dict(filter_size=3, sigma_clip=SigmaClip(sigma=3.0), bkg_estimator=MedianBackground())
+    for pct in (10.0, 50.0, 90.0):
+        try:
+            return Background2D(img, box, mask=mask, exclude_percentile=pct, **kw)
+        except ValueError:
+            continue
+    return None
+
+
+class _FlatBackground:
+    """Last-resort fallback: one sigma-clipped level for the whole frame (same attributes as Background2D)."""
+    def __init__(self, img, mask=None):
+        data = img[~mask] if mask is not None and (~mask).any() else img.ravel()
+        _, med, std = sigma_clipped_stats(data, sigma=3.0)
+        self.background = np.full(img.shape, float(med))
+        self.background_rms = np.full(img.shape, float(std))
+        self.background_rms_median = float(std)
+
+
+def upsample_bicubic(x: torch.Tensor, scale: int) -> torch.Tensor:
+    """(N,C,H,W) bicubic upsampling with the pixel-centre convention used by block_sum."""
+    return F.interpolate(x, scale_factor=scale, mode="bicubic", align_corners=False)
+
+
+def prepare_network_pair(frame: dict, sim: SimConfig = SIM) -> dict:
+    s = frame["upscale"]
+    bad_lr = frame["invalid_lr"] | frame["saturated_lr"]
+    psf = frame["psf_total"]                         # in deployment, measure the FWHM from stars instead
+    fwhm_lr = float(np.atleast_1d(fit_fwhm(psf, xypos=(psf.shape[0] // 2,) * 2, fit_shape=_odd(min(psf.shape[0], 31))))[0]) / s
+    bkg = estimate_background(frame["lr_e"], sim.bkg_box_lr, mask=bad_lr if bad_lr.any() else None, psf_fwhm_lr=fwhm_lr)
+    sigma_lr = float(bkg.background_rms_median)                      # e- per detector pixel
+    lr_bs = frame["lr_e"] - bkg.background
+    x = upsample_bicubic(torch.from_numpy(lr_bs / sigma_lr)[None, None].float(), s)   # surface brightness, noise units
+    scale_e = sigma_lr / s**2                                        # electrons per unit, on the HR grid
+    y = torch.from_numpy(frame["target"] / scale_e)[None, None].float()
+    kron = np.ones((s, s), dtype=bool)
+    return dict(
+        x=x, y=y, electrons_per_unit=scale_e, sigma_lr_e=sigma_lr,
+        background_lr=bkg.background, bkg_residual_lr=bkg.background - frame["sky_true_lr"],
+        exclude_hr=np.kron(bad_lr, kron) | frame["invalid_hr"],
+    )
+
+# %% [markdown]
+# ## 3 · Architecture: photometry-aware SRCNN
+#
+# Base: SRCNN 9-5-5 (Dong et al. 2016; the 9-5-5 variant beats the original 9-1-5) on a bicubically pre-upsampled input.
+# Changes for astronomical photometry:
+#
+# * **Global residual, zero-initialised reconstruction layer.** At step 0 the model is exactly the identity on the bicubic
+#   input, and bicubic interpolation conserves flux. Training learns a correction that redistributes flux locally (sharpening);
+#   it does not have to rebuild the absolute flux scale.
+# * **Flux-conserving residual (`flux_window=17`).** The correction's local 17×17 mean is subtracted before it is added to
+#   the input. The network can therefore only *move* light within its receptive field, which is what sharpening needs. It
+#   cannot add or remove net flux in any aperture much larger than 17 px, and the photometric aperture is ~50 px across. In a
+#   synthetic training check, the plain residual traded photometry for sharpness: the 90th-percentile flux error grew to
+#   ~14 % while the image loss fell. This constraint held it near the bicubic level with almost the same image-loss gain.
+# * **No output ReLU / clamp.** Background-subtracted data is legitimately negative in sky pixels. Clamping biases faint-star
+#   apertures upward.
+# * **No bias in the last layer.** A learned constant would add a pedestal everywhere, which the flux metric (raw aperture
+#   sums) correctly counts as non-conservation.
+# * **No batch norm.** It rescales activations by batch statistics, breaking the linear flux scale (EDSR made the same choice).
+# * **Replicate padding, "same" size.** Every output pixel is defined; the training loss will still ignore a border of
+#   `receptive_field // 2`.
+#
+# Receptive field = 9 + 5 + 5 − 2 = 17 HR px ≈ 10″. That covers the core of a 3″ seeing disc plus a few arcseconds of drift.
+# If your mount trails more than that, increase `f1` (e.g. 13) rather than adding depth.
+
+# %%
+class AstroSRCNN(nn.Module):
+    def __init__(self, channels: int = 1, n1: int = 64, n2: int = 32, f1: int = 9, f2: int = 5, f3: int = 5,
+                 residual: bool = True, padding_mode: str = "replicate", flux_window: int = 17):
+        super().__init__()
+        self.residual = residual
+        self.flux_window = flux_window if flux_window % 2 == 1 or flux_window == 0 else flux_window + 1
+        self.extract = nn.Conv2d(channels, n1, f1, padding=f1 // 2, padding_mode=padding_mode)      # patch extraction
+        self.nonlinear_map = nn.Conv2d(n1, n2, f2, padding=f2 // 2, padding_mode=padding_mode)  # non-linear mapping
+        self.reconstruct = nn.Conv2d(n2, channels, f3, padding=f3 // 2, padding_mode=padding_mode, bias=False)
+        self.act = nn.ReLU(inplace=True)
+        self.receptive_field = f1 + f2 + f3 - 2
+        for m in (self.extract, self.nonlinear_map):
+            nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+            nn.init.zeros_(m.bias)
+        if residual:
+            nn.init.zeros_(self.reconstruct.weight)        # identity at initialisation
+        else:
+            nn.init.normal_(self.reconstruct.weight, std=1e-3)  # Dong et al.'s choice for the last layer
+
+    def forward(self, x_up: torch.Tensor) -> torch.Tensor:
+        """x_up: bicubic-upsampled, background-subtracted, noise-normalised LR frame, shape (N, C, H, W)."""
+        h = self.act(self.extract(x_up))
+        h = self.act(self.nonlinear_map(h))
+        out = self.reconstruct(h)
+        if self.residual and self.flux_window:
+            # Flux-conserving residual: remove the local mean of the correction, so it can only move light within
+            # flux_window px (sharpening) and adds no net flux to any aperture much larger than that.
+            out = out - F.avg_pool2d(out, self.flux_window, stride=1, padding=self.flux_window // 2, count_include_pad=False)
+        return x_up + out if self.residual else out
+
+
+def count_parameters(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+# %% [markdown]
+# ## 4 · Evaluation metrics (photutils)
+#
+# **Which sources count as point sources.** Point sources are defined on the *target*, not on the network output, so a
+# network can't improve its score by hallucinating or deleting stars. A source qualifies only if:
+# * DAOStarFinder finds it on the target with tight sharpness and roundness bounds;
+# * its Gaussian-PRF FWHM on the target is within ±25 % of the known target PSF, and its moment ellipticity is below 0.12
+#   (a compact galaxy that behaves like the PSF at 1.2″ counts as a point source, which is fine operationally);
+# * it supplies ≥ 90 % of the target's above-background light within its photometric footprint (≥ 95 % within the shape-fit
+#   footprint). The target is noiseless and sky-free, so this is an exact test against crowding and structured nebulosity.
+#   Fainter neighbours inside the aperture are allowed: the same-aperture comparison counts their light in both images;
+# * it has no saturated, masked or edge pixels inside the aperture;
+# * for flux (when the input PSF is known, as in simulation), the noiseless target blurred by that PSF must reproduce the
+#   target's aperture sum, after allowing for the PSF's own encircled energy, to within 1 %. A brighter neighbour just outside
+#   the aperture is compact in the target but spills its wings into the aperture in any blurred image. No method can undo
+#   that, so such stars are excluded rather than allowed to dominate the error statistics.
+#
+# **Metrics.**
+# * **FWHM:** `photutils.psf.fit_fwhm` (circular Gaussian PRF integrated over pixels, so unbiased even when undersampled).
+# * **Ellipticity:** 1 − b/a from second moments (`data_properties`) inside a circular window of 2.5 × FWHM after
+#   local-background subtraction (unbiased to e < 0.001 for round stars down to FWHM = 2 px). Orientation is reported too:
+#   a coherent orientation across the field is the signature of residual mount drift.
+# * **Flux conservation:** raw aperture sums with the **same** aperture on target, prediction and input.
+#   * The aperture encloses ≥ 99 % of the *input* PSF's energy, so the test asks "did the network create or destroy light?"
+#     and not "did it pull in the seeing halo?". A long-exposure Kolmogorov PSF keeps only ~95 % of its light inside
+#     3 × FWHM, and SRCNN's 17-px receptive field cannot gather halo light from farther out. A small aperture would charge
+#     the network for physics it cannot undo. In simulation the radius comes from the known PSF (`encircled_energy_radius`);
+#     on real data, use the growth curve of bright stars. Expect a floor of about −1 % (the light outside the aperture).
+#   * No local annulus subtraction. Frames are background-subtracted upstream, and the halo leaks into the annulus of the
+#     blurred images only, which biased them 1-2 % low in testing. A pedestal added by the network therefore counts as a
+#     flux error, as it should.
+#   * Only stars whose expected photometric noise is below `flux_tol / 2.5` are used (SNR ≥ 100 for a 2.5 % limit).
+#     Otherwise photon noise, not the network, sets the error. Pass rule: at least 90 % of those stars within ±2.5 %. The
+#     bicubic input is scored the same way as a baseline.
+
+# %%
+def encircled_energy_radius(psf: np.ndarray, ee: float = 0.99) -> float:
+    """Radius (px) containing a fraction `ee` of a centred PSF's energy."""
+    c = psf.shape[0] // 2
+    yy, xx = np.indices(psf.shape) - c
+    r = np.hypot(xx, yy).ravel()
+    order = np.argsort(r)
+    return float(r[order][np.searchsorted(np.cumsum(psf.ravel()[order]) / psf.sum(), ee)])
+
+
+def _xy(tbl):
+    xc = "x_centroid" if "x_centroid" in tbl.colnames else "xcentroid"
+    yc = "y_centroid" if "y_centroid" in tbl.colnames else "ycentroid"
+    return np.column_stack([np.asarray(tbl[xc], float), np.asarray(tbl[yc], float)])
+
+
+def _odd(n: float) -> int:
+    n = int(math.ceil(n))
+    return n + (n % 2 == 0)
+
+
+def _to_numpy(img) -> np.ndarray:
+    if isinstance(img, torch.Tensor):
+        img = img.detach().float().cpu().numpy()
+    return np.asarray(np.squeeze(img), dtype=np.float64)
+
+
+def select_point_sources(target: np.ndarray, psf_fwhm_px: float, *, noise_sigma: float = 1.0,
+                         nsigma_detect: float = 15.0, fwhm_tol: float = 0.25, max_ellipticity: float = 0.12) -> np.ndarray:
+    """Positions (N, 2) of sources on the target whose profile matches the known target PSF."""
+    cand = DAOStarFinder(threshold=nsigma_detect * noise_sigma, fwhm=psf_fwhm_px, exclude_border=True,
+                         sharpness_range=(0.3, 1.0), roundness_range=(-0.25, 0.25))(target)
+    if cand is None or len(cand) == 0:
+        return np.empty((0, 2))
+    xy = _xy(cand)
+    m = measure_point_sources(target, xy, ap_r=2 * psf_fwhm_px, ann_in=3 * psf_fwhm_px, ann_out=4.5 * psf_fwhm_px,
+                              fit_box=_odd(4 * psf_fwhm_px))
+    ok = np.asarray((np.abs(m["fwhm"] / psf_fwhm_px - 1) < fwhm_tol) & (m["ellipticity"] < max_ellipticity))
+    return xy[ok]
+
+
+def measure_point_sources(img: np.ndarray, xy: np.ndarray, *, ap_r: float, ann_in: float, ann_out: float,
+                          fit_box: int, window_fwhm_factor: float = 2.5, subtract_annulus: bool = True) -> Table:
+    # subtract_annulus: subtract the sigma-clipped annulus median from the aperture sum. Turn it off for frames that are
+    # already background-subtracted and whose PSF has an extended halo: the halo leaks into the annulus and biases the
+    # flux low by about the halo fraction, but only in the blurred images, never in the halo-free target.
+    # window_fwhm_factor: radius of the circular moment window. 2.5 x FWHM is unbiased (e < 0.001) for pixel-integrated
+    # round Gaussians down to FWHM = 2 px; 1.5 x leaves a pixelisation floor of e ~ 0.05.
+    """Aperture flux, local background, Gaussian-PRF FWHM and moment ellipticity at fixed positions."""
+    n = len(xy)
+    out = Table({k: np.full(n, np.nan) for k in
+                 ("x", "y", "flux", "bkg", "bkg_std", "fwhm", "ellipticity", "orientation_deg")})
+    if n == 0:
+        return out
+    out["x"], out["y"] = xy[:, 0], xy[:, 1]
+    ann = ApertureStats(img, CircularAnnulus(xy, ann_in, ann_out), sigma_clip=SigmaClip(sigma=3.0))
+    bkg, bkg_std = np.atleast_1d(ann.median), np.atleast_1d(ann.std)
+    phot = ApertureStats(img, CircularAperture(xy, ap_r), local_bkg=bkg if subtract_annulus else None)
+    out["flux"], out["bkg"], out["bkg_std"] = np.atleast_1d(phot.sum), bkg, bkg_std
+
+    half = fit_box // 2 + int(math.ceil(ann_out))
+    ny, nx = img.shape
+    for i, (x, y) in enumerate(xy):
+        x0, y0 = int(round(x)) - half, int(round(y)) - half
+        if x0 < 0 or y0 < 0 or x0 + 2 * half + 1 > nx or y0 + 2 * half + 1 > ny:
+            continue
+        cut = img[y0:y0 + 2 * half + 1, x0:x0 + 2 * half + 1] - bkg[i]
+        lx, ly = x - x0, y - y0
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                fw = float(np.atleast_1d(fit_fwhm(cut, xypos=(lx, ly), fit_shape=fit_box))[0])
+        except Exception:
+            fw = np.nan
+        if not (0.5 < fw < fit_box):                     # failed / runaway fit (e.g. a neighbour inside the box)
+            fw = np.nan
+        out["fwhm"][i] = fw
+        r_win = max(2.0, window_fwhm_factor * (fw if np.isfinite(fw) and fw > 0 else fit_box / 3))
+        yy, xx = np.indices(cut.shape)
+        outside = np.hypot(xx - lx, yy - ly) > r_win
+        try:
+            props = data_properties(np.clip(cut, 0, None), mask=outside)
+            out["ellipticity"][i] = float(np.asarray(props.ellipticity))
+            out["orientation_deg"][i] = float(np.asarray(props.orientation))
+        except Exception:
+            pass
+    return out
+
+
+def evaluate_sr(pred, target, inp=None, *, psf_fwhm_target_px: float = SIM.target_fwhm_hr_px, upscale: int = SIM.upscale,
+                noise_sigma_lr: float = 1.0, electrons_per_unit: float | None = None, exclude_mask: np.ndarray | None = None,
+                flux_tol: float = 0.025, pass_quantile: float = 0.90, ap_radius_px: float | None = None,
+                ap_fwhm_factor: float = 3.0, min_dominance_flux: float = 0.90, min_dominance_shape: float = 0.95,
+                min_snr_shape: float = 30.0, max_fit_box: int = 31, pixel_scale_arcsec: float | None = None,
+                input_psf: np.ndarray | None = None, max_contamination: float = 0.01):
+    """Score an SR prediction against its target (and optionally the bicubic input as a baseline).
+
+    All images share the HR grid and units (for example the tensors from prepare_network_pair). Returns (summary, per-star table).
+    noise_sigma_lr: input noise per *detector* pixel in image units (1.0 after prepare_network_pair).
+    electrons_per_unit: if given, source shot noise is included in the per-star SNR.
+    ap_radius_px: photometric aperture (HR px). Pass encircled_energy_radius(input_psf, 0.99) when the PSF is known;
+                  otherwise ap_fwhm_factor x the input's median FWHM is used (this under-captures the seeing halo).
+    min_dominance_flux / _shape: the star must supply this fraction of all target light within the photometric footprint
+                  (outer annulus radius) / the shape-fit footprint. The target is noiseless and sky-free, so this is an
+                  exact crowding and nebulosity test. Fainter neighbours inside the aperture are allowed because the
+                  same-aperture comparison counts their light in both pred and target (a test of local flux conservation).
+    input_psf / max_contamination: if the input PSF is known (simulation), blur the noiseless target with it and keep flux
+                  stars whose aperture sum in that blurred target equals the target's times the PSF's own encircled energy
+                  to within max_contamination. This rejects apertures that a brighter neighbour's wings cross: light that
+                  no method could put back, which would otherwise show up as a large flux error for bicubic and SR alike.
+    """
+    pred, target = _to_numpy(pred), _to_numpy(target)
+    inp = None if inp is None else _to_numpy(inp)
+    ref = inp if inp is not None else pred                      # broadest image sets the aperture
+
+    xy = select_point_sources(target, psf_fwhm_target_px, noise_sigma=noise_sigma_lr)
+    if len(xy) == 0:
+        return {"n_point_sources": 0}, Table()
+
+    # Aperture sized from the input's median FWHM so it captures ~all of the flux in every image.
+    probe = measure_point_sources(ref, xy[:60], ap_r=3, ann_in=max_fit_box / 2 + 2, ann_out=max_fit_box / 2 + 8,
+                                  fit_box=max_fit_box)
+    fw_probe = np.asarray(probe["fwhm"], float)
+    fwhm_ref = float(np.nanmedian(fw_probe)) if np.isfinite(fw_probe).any() else float("nan")
+    if not np.isfinite(fwhm_ref):
+        fwhm_ref = 3 * psf_fwhm_target_px
+    ap_r = float(ap_radius_px) if ap_radius_px else max(3.0, ap_fwhm_factor * fwhm_ref)
+    ann_in, ann_out = ap_r + 2.0, ap_r + 2.0 + max(5.0, fwhm_ref)
+    fit_box = min(max_fit_box, _odd(3 * fwhm_ref))
+
+    # Edge and mask cuts.
+    ny, nx = target.shape
+    edge = ann_out + fit_box // 2 + 1
+    keep = (xy[:, 0] > edge) & (xy[:, 0] < nx - 1 - edge) & (xy[:, 1] > edge) & (xy[:, 1] < ny - 1 - edge)
+    if exclude_mask is not None and exclude_mask.any():   # saturated / masked pixels anywhere inside the aperture
+        bad = np.atleast_1d(ApertureStats(exclude_mask.astype(float), CircularAperture(xy, ann_in)).sum) > 0
+        keep &= ~bad
+    xy = xy[keep]
+    if len(xy) == 0:
+        return {"n_point_sources": 0}, Table()
+
+    # Raw same-aperture sums (frames are background-subtracted upstream). A DC pedestal added by the network therefore
+    # counts as a flux error, which it is. FWHM and ellipticity still use the local annulus level.
+    kw = dict(ap_r=ap_r, ann_in=ann_in, ann_out=ann_out, fit_box=fit_box, subtract_annulus=False)
+    mt = measure_point_sources(target, xy, **kw)
+    mp = measure_point_sources(pred, xy, **kw)
+    mi = measure_point_sources(inp, xy, **kw) if inp is not None else None
+
+    # Crowding / structured nebulosity: fraction of the target's light above its local (annulus) level, within each
+    # footprint, that belongs to this star. A smooth pedestal cancels; neighbours and nebular structure do not.
+    bkg_t = np.asarray(mt["bkg"])
+
+    def excess(r):
+        return np.atleast_1d(ApertureStats(target, CircularAperture(xy, r)).sum) - bkg_t * math.pi * r**2
+    core = excess(3.0 * psf_fwhm_target_px)                     # the target star itself (Gaussian: >99.99 %)
+    dom_flux = core / np.maximum(excess(ann_out), 1e-12)
+    dom_shape = core / np.maximum(excess(fit_box / 2 + fwhm_ref), 1e-12)
+
+    area = math.pi * ap_r**2
+    var = (noise_sigma_lr * upscale) ** 2 * area                # sky + read noise: s^2 * N_LR in these units
+    if electrons_per_unit:
+        var = var + np.clip(np.asarray(mt["flux"]), 0, None) / electrons_per_unit
+    snr = np.asarray(mt["flux"]) / np.sqrt(var)
+    flux_ok = (snr >= 2.5 / flux_tol) & (dom_flux >= min_dominance_flux) & (np.asarray(mt["flux"]) > 0)
+    shape_ok = (snr >= min_snr_shape) & (dom_shape >= min_dominance_shape)
+    contamination = np.full(len(xy), np.nan)
+    if input_psf is not None:
+        psf_n = input_psf / input_psf.sum()
+        c = psf_n.shape[0] // 2
+        ee = float(ApertureStats(psf_n, CircularAperture((c, c), ap_r)).sum)
+        ideal = signal.fftconvolve(target, psf_n, mode="same")
+        ideal_ap = np.atleast_1d(ApertureStats(ideal, CircularAperture(xy, ap_r)).sum)
+        contamination = np.abs(ideal_ap / np.asarray(mt["flux"]) - ee)
+        flux_ok &= contamination <= max_contamination
+
+    tbl = Table({"x": xy[:, 0], "y": xy[:, 1], "snr": snr, "contamination": contamination,
+                 "dom_flux": dom_flux, "dom_shape": dom_shape, "flux_star": flux_ok, "shape_star": shape_ok,
+                 "flux_target": mt["flux"], "flux_pred": mp["flux"],
+                 "fwhm_target": mt["fwhm"], "fwhm_pred": mp["fwhm"],
+                 "ell_target": mt["ellipticity"], "ell_pred": mp["ellipticity"], "theta_pred": mp["orientation_deg"]})
+    tbl["dflux_pred"] = tbl["flux_pred"] / tbl["flux_target"] - 1
+    if mi is not None:
+        tbl["flux_input"], tbl["fwhm_input"], tbl["ell_input"] = mi["flux"], mi["fwhm"], mi["ellipticity"]
+        tbl["dflux_input"] = tbl["flux_input"] / tbl["flux_target"] - 1
+
+    def flux_stats(col):
+        d = np.asarray(tbl[col])[flux_ok]
+        d = d[np.isfinite(d)]
+        if d.size == 0:
+            return dict(n=0)
+        a = np.abs(d)
+        return dict(n=int(d.size), median_abs=float(np.median(a)), q_abs=float(np.quantile(a, pass_quantile)),
+                    bias=float(np.median(d)), frac_within_tol=float(np.mean(a < flux_tol)),
+                    passes=bool(np.quantile(a, pass_quantile) < flux_tol))
+
+    def med(col, sel):
+        v = np.asarray(tbl[col])[sel]
+        v = v[np.isfinite(v)]
+        return float(np.median(v)) if v.size else float("nan")
+
+    summary = {
+        "n_point_sources": int(len(tbl)), "n_shape_stars": int(shape_ok.sum()), "n_flux_stars": int(flux_ok.sum()),
+        "aperture_radius_px": ap_r,
+        "fwhm_px": {k: med(f"fwhm_{k}", shape_ok) for k in ("target", "pred", "input") if f"fwhm_{k}" in tbl.colnames},
+        "ellipticity": {k: med(f"ell_{k}", shape_ok) for k in ("target", "pred", "input") if f"ell_{k}" in tbl.colnames},
+        "flux_pred": flux_stats("dflux_pred"),
+    }
+    if mi is not None:
+        summary["flux_input_baseline"] = flux_stats("dflux_input")
+    if pixel_scale_arcsec:
+        summary["fwhm_arcsec"] = {k: v * pixel_scale_arcsec for k, v in summary["fwhm_px"].items()}
+    summary["flux_limit"] = f"|ΔF/F| < {flux_tol:.1%} for ≥{pass_quantile:.0%} of SNR≥{2.5 / flux_tol:.0f} point sources"
+    return summary, tbl
+
